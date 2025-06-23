@@ -372,8 +372,8 @@ static const char *BlockStateAsString(TBlockState blockState);
 static const char *TransStateAsString(TransState state);
 
 /* For GUCs */
-static bool CommitDelayMinIsSet = false;
-static bool CommitDelayMaxIsSet = false;
+/* static bool CommitDelayMinIsSet = false; // Not needed with revised logic */
+/* static bool CommitDelayMaxIsSet = false; // Not needed with revised logic */
 
 /* GUC check and assign hooks */
 static bool check_commit_delay(int *newval, void **extra, GucSource source);
@@ -386,6 +386,9 @@ static bool check_commit_delay_hint(int *newval, void **extra, GucSource source)
 static void assign_commit_delay_hint(int newval, void *extra);
 
 static void update_commit_delay_hint_clamped(void);
+
+/* Max value for commit_delay, commit_delay_min, commit_delay_max, commit_delay_hint */
+#define GUC_MAX_COMMIT_DELAY 100000
 
 
 /* ----------------------------------------------------------------
@@ -5853,105 +5856,103 @@ xactGetCommittedChildren(TransactionId **ptr)
 }
 
 /*
- * Clamp a value between a minimum and a maximum.
- */
-static inline int
-clamp(int value, int min_val, int max_val)
-{
-	if (value < min_val)
-		return min_val;
-	if (value > max_val)
-		return max_val;
-	return value;
-}
-
-/*
  * Update the clamped commit_delay_hint for the current session.
  * This should be called whenever CommitDelay, CommitDelayMin, CommitDelayMax,
  * or the user-set CommitDelayHint changes.
  * It's also called during InitProcess to set the initial clamped value.
  */
+/*
+ * Update the clamped commit_delay_hint for the current session.
+ * This should be called whenever CommitDelay, commit_delay_min,
+ * commit_delay_max, or the user-set commit_delay_hint changes.
+ * It's also called during InitProcess to set the initial clamped value.
+ */
 static void
 update_commit_delay_hint_clamped(void)
 {
-	if (MyProc != NULL) /* MyProc is NULL during early GUC initialization or if called too early */
+	if (MyProc != NULL)
 	{
+		int base_hint_value;
+		int effective_hint;
+		GucSource hint_source;
+
 		/*
-		 * The global CommitDelayHint variable holds the user's *desired* value for the
-		 * current session. We clamp this against the current global CommitDelayMin
-		 * and CommitDelayMax.
+		 * Determine the source of commit_delay_hint to decide if it's using
+		 * the default value (0) which should then be overridden by global CommitDelay.
+		 * We use the current C variable `commit_delay_hint` which has already been
+		 * updated by the GUC framework if this is called from an assign hook for it.
+		 * For other assign hooks (CommitDelay, commit_delay_min, commit_delay_max),
+		 * `commit_delay_hint` C var reflects its current session value.
 		 */
-		MyProc->commit_delay_hint_clamped = clamp(CommitDelayHint, CommitDelayMin, CommitDelayMax);
+		hint_source = GetConfigOptionSource("commit_delay_hint");
+
+		if (commit_delay_hint == 0 && hint_source <= PGC_S_FILE)
+			base_hint_value = CommitDelay;	/* Global CommitDelay GUC's C variable */
+		else
+			base_hint_value = commit_delay_hint; /* Session's commit_delay_hint C variable */
+
+		effective_hint = base_hint_value;
+
+		/*
+		 * Clamp by commit_delay_max (global C variable), if it's set (non-zero).
+		 * Note: commit_delay_max C variable holds the current active value from GUC system.
+		 */
+		if (commit_delay_max > 0 && effective_hint > commit_delay_max)
+			effective_hint = commit_delay_max;
+
+		/*
+		 * Clamp by commit_delay_min (global C variable).
+		 * Note: commit_delay_min C variable holds the current active value from GUC system.
+		 */
+		if (effective_hint < commit_delay_min)
+			effective_hint = commit_delay_min;
+
+		/*
+		 * The individual GUCs (commit_delay_hint, commit_delay_min, commit_delay_max, CommitDelay)
+		 * are already capped at GUC_MAX_COMMIT_DELAY by their own check functions.
+		 * So, the effective_hint derived from these will also be within this range.
+		 * Final check for safety.
+		 */
+		if (effective_hint > GUC_MAX_COMMIT_DELAY)
+			effective_hint = GUC_MAX_COMMIT_DELAY;
+		if (effective_hint < 0) /* Should be caught by individual checks */
+			effective_hint = 0;
+
+		MyProc->commit_delay_hint_clamped = effective_hint;
 	}
 	/*
-	 * If MyProc is NULL (e.g. postmaster loading config before forking),
-	 * there's no per-process value to update yet. InitProcess will set it.
+	 * If MyProc is NULL (e.g. postmaster loading config before forking, or some utility modes),
+	 * there's no per-process value to update yet. InitProcess will call this for normal backends.
 	 */
 }
 
 
 /*
- * Check hook for commit_delay
+ * Check hook for commit_delay (the original GUC)
  */
 static bool
 check_commit_delay(int *newval, void **extra, GucSource source)
 {
-	if (*newval < 0 || *newval > 100000) /* Standard limits for commit_delay */
+	if (*newval < 0 || *newval > GUC_MAX_COMMIT_DELAY)
 	{
-		GUC_check_errmsg("commit_delay must be between 0 and 100000 microseconds.");
+		GUC_check_errmsg("commit_delay must be between 0 and %d microseconds.", GUC_MAX_COMMIT_DELAY);
+		GUC_check_errdetail("Value given: %d us.", *newval);
 		return false;
-	}
-
-	/*
-	 * When commit_delay is changed, it must remain within the currently set
-	 * commit_delay_min and commit_delay_max.
-	 * Skip this check if source is PGC_S_DEFAULT or PGC_S_FILE during postmaster startup,
-	 * as min/max might not be initialized or might be set *after* commit_delay.
-	 * The assign hooks will reconcile these.
-	 */
-	if (source > PGC_S_FILE || (source == PGC_S_FILE && MyProc != NULL /* i.e., SIGHUP in backend */))
-	{
-		if (CommitDelayMinIsSet && *newval < CommitDelayMin)
-		{
-			GUC_check_errmsg("commit_delay (%d us) cannot be less than commit_delay_min (%d us)", *newval, CommitDelayMin);
-			return false;
-		}
-		if (CommitDelayMaxIsSet && *newval > CommitDelayMax)
-		{
-			GUC_check_errmsg("commit_delay (%d us) cannot be greater than commit_delay_max (%d us)", *newval, CommitDelayMax);
-			return false;
-		}
 	}
 	return true;
 }
 
 /*
- * Assign hook for commit_delay
+ * Assign hook for commit_delay (the original GUC)
  */
 static void
 assign_commit_delay(int newval, void *extra)
 {
-	/* Update dependent GUCs if they are at their default source */
-	if (GetConfigOptionSource("commit_delay_min") == PGC_S_DEFAULT)
-		CommitDelayMin = newval;
-	else if (CommitDelayMin > newval && newval >=0)
-		CommitDelayMin = newval;
-
-	if (GetConfigOptionSource("commit_delay_max") == PGC_S_DEFAULT)
-		CommitDelayMax = newval;
-	else if (CommitDelayMax != 0 && CommitDelayMax < newval)
-		CommitDelayMax = newval;
-
-	// If the session's commit_delay_hint GUC is currently at its
-	// compiled-in default (0), and it wasn't set by the user in this session
-	// (i.e. source is default or from config file), then make it follow the new global CommitDelay.
-	// This ensures that if a user hasn't set a session-specific hint,
-	// the effective hint tracks the global setting after a SIGHUP.
-	if (CommitDelayHint == 0 && GetConfigOptionSource("commit_delay_hint") <= PGC_S_FILE)
-	{
-		CommitDelayHint = newval;
-	}
-
+	/*
+	 * When global CommitDelay changes, the per-process clamped hint might need
+	 * to be updated if the session's commit_delay_hint was relying on the
+	 * global CommitDelay.
+	 */
 	update_commit_delay_hint_clamped();
 }
 
@@ -5961,29 +5962,66 @@ assign_commit_delay(int newval, void *extra)
 static bool
 check_commit_delay_min(int *newval, void **extra, GucSource source)
 {
+	int			effective_current_hint_val;
+	GucSource	current_hint_source;
+
 	if (*newval < 0)
 	{
-		GUC_check_errmsg("commit_delay_min cannot be negative.");
+		GUC_check_errmsg("commit_delay_min must not be negative.");
+		GUC_check_errdetail("Value given: %d us.", *newval);
 		return false;
 	}
-	if (*newval > 100000) /* Max of commit_delay_hint itself */
+	if (*newval > GUC_MAX_COMMIT_DELAY)
 	{
-		GUC_check_errmsg("commit_delay_min cannot exceed 100000 microseconds.");
+		GUC_check_errmsg("commit_delay_min must not exceed %d microseconds.", GUC_MAX_COMMIT_DELAY);
+		GUC_check_errdetail("Value given: %d us.", *newval);
 		return false;
 	}
 
 	/*
-	 * commit_delay_min must be <= commit_delay_max, unless commit_delay_max is 0 (no explicit max).
-	 * Skip this check if source is PGC_S_DEFAULT or PGC_S_FILE during postmaster startup,
-	 * as max might not be initialized or might be set *after* min.
+	 * Cross-GUC checks are skipped during initial postmaster startup from postgresql.conf
+	 * (source <= PGC_S_FILE && MyProc == NULL), because the order of GUC initialization
+	 * is not guaranteed. They apply for SET, ALTER SYSTEM, and SIGHUP in live backends.
 	 */
-	if (CommitDelayMaxIsSet && CommitDelayMax != 0 && *newval > CommitDelayMax &&
-		(source > PGC_S_FILE || (source == PGC_S_FILE && MyProc != NULL)))
+	if (!(source <= PGC_S_FILE && MyProc == NULL))
 	{
-		GUC_check_errmsg("commit_delay_min (%d us) cannot be greater than commit_delay_max (%d us).", *newval, CommitDelayMax);
-		return false;
+		/* commit_delay_min must be <= commit_delay_max, if commit_delay_max is set (non-zero) */
+		if (commit_delay_max != 0 && *newval > commit_delay_max)
+		{
+			GUC_check_errmsg("commit_delay_min (%d us) must not be greater than commit_delay_max (%d us).",
+							 *newval, commit_delay_max);
+			return false;
+		}
+
+		/*
+		 * commit_delay_min must also not be greater than the current effective hint.
+		 * The "effective hint" is commit_delay_hint if set by user for the session,
+		 * else global CommitDelay. This value is then itself subject to min/max clamping.
+		 * For this check, we care about the hint *before* it's clamped by the *new* min.
+		 */
+		current_hint_source = GetConfigOptionSource("commit_delay_hint");
+		if (commit_delay_hint == 0 && current_hint_source <= PGC_S_FILE)
+			effective_current_hint_val = CommitDelay;
+		else
+			effective_current_hint_val = commit_delay_hint;
+
+		/* Apply current commit_delay_max if it's active, for a realistic hint value */
+		if (commit_delay_max != 0 && effective_current_hint_val > commit_delay_max)
+			effective_current_hint_val = commit_delay_max;
+
+		/* Ensure the hint we are checking against is itself valid */
+		if (effective_current_hint_val > GUC_MAX_COMMIT_DELAY) effective_current_hint_val = GUC_MAX_COMMIT_DELAY;
+		if (effective_current_hint_val < 0) effective_current_hint_val = 0;
+
+
+		if (*newval > effective_current_hint_val)
+		{
+			GUC_check_errmsg("commit_delay_min (%d us) must not be greater than the current effective commit_delay_hint (%d us).",
+							 *newval, effective_current_hint_val);
+			GUC_check_errdetail("Effective hint is derived from session commit_delay_hint (or global commit_delay if session hint is default/0), potentially clamped by commit_delay_max (if set).");
+			return false;
+		}
 	}
-	CommitDelayMinIsSet = true;
 	return true;
 }
 
@@ -6002,30 +6040,61 @@ assign_commit_delay_min(int newval, void *extra)
 static bool
 check_commit_delay_max(int *newval, void **extra, GucSource source)
 {
-	if (*newval < 0)
+	int			effective_current_hint_val;
+	GucSource	current_hint_source;
+
+	/* newval == 0 means no explicit maximum */
+	if (*newval != 0 && *newval < 0)
 	{
-		GUC_check_errmsg("commit_delay_max cannot be negative.");
+		GUC_check_errmsg("commit_delay_max must not be negative, unless it is 0 (no limit).");
+		GUC_check_errdetail("Value given: %d us.", *newval);
 		return false;
 	}
-	if (*newval > 100000) /* Max of commit_delay_hint itself */
+	if (*newval > GUC_MAX_COMMIT_DELAY) /* This also correctly allows 0 to pass */
 	{
-		GUC_check_errmsg("commit_delay_max cannot exceed 100000 microseconds.");
+		GUC_check_errmsg("commit_delay_max must not exceed %d microseconds.", GUC_MAX_COMMIT_DELAY);
+		GUC_check_errdetail("Value given: %d us.", *newval);
 		return false;
 	}
 
-	/*
-	 * If commit_delay_max is not 0 (meaning "no explicit max"),
-	 * it must be >= commit_delay_min.
-	 * Skip this check if source is PGC_S_DEFAULT or PGC_S_FILE during postmaster startup,
-	 * as min might not be initialized or might be set *after* max.
-	 */
-	if (*newval != 0 && CommitDelayMinIsSet && *newval < CommitDelayMin &&
-		(source > PGC_S_FILE || (source == PGC_S_FILE && MyProc != NULL)))
+	if (!(source <= PGC_S_FILE && MyProc == NULL))
 	{
-		GUC_check_errmsg("commit_delay_max (%d us) cannot be less than commit_delay_min (%d us).", *newval, CommitDelayMin);
-		return false;
+		/* If commit_delay_max is not 0, it must be >= commit_delay_min. */
+		if (*newval != 0 && *newval < commit_delay_min)
+		{
+			GUC_check_errmsg("commit_delay_max (%d us) must not be less than commit_delay_min (%d us).",
+							 *newval, commit_delay_min);
+			return false;
+		}
+
+		/*
+		 * commit_delay_max (if not 0) must also not be less than the current effective hint.
+		 * The "effective hint" is commit_delay_hint if set by user for the session,
+		 * else global CommitDelay. This value is then itself subject to min/max clamping.
+		 * For this check, we care about the hint *before* it's clamped by the *new* max.
+		 */
+		current_hint_source = GetConfigOptionSource("commit_delay_hint");
+		if (commit_delay_hint == 0 && current_hint_source <= PGC_S_FILE)
+			effective_current_hint_val = CommitDelay;
+		else
+			effective_current_hint_val = commit_delay_hint;
+
+		/* Apply current commit_delay_min for a realistic hint value */
+		if (effective_current_hint_val < commit_delay_min)
+			effective_current_hint_val = commit_delay_min;
+
+		/* Ensure the hint we are checking against is itself valid */
+		if (effective_current_hint_val > GUC_MAX_COMMIT_DELAY) effective_current_hint_val = GUC_MAX_COMMIT_DELAY;
+		if (effective_current_hint_val < 0) effective_current_hint_val = 0;
+
+		if (*newval != 0 && *newval < effective_current_hint_val)
+		{
+			GUC_check_errmsg("commit_delay_max (%d us) must not be less than the current effective commit_delay_hint (%d us).",
+							 *newval, effective_current_hint_val);
+			GUC_check_errdetail("Effective hint is derived from session commit_delay_hint (or global commit_delay if session hint is default/0), potentially clamped by commit_delay_min.");
+			return false;
+		}
 	}
-	CommitDelayMaxIsSet = true;
 	return true;
 }
 
@@ -6046,10 +6115,17 @@ check_commit_delay_hint(int *newval, void **extra, GucSource source)
 {
 	if (*newval < 0)
 	{
-		GUC_check_errmsg("commit_delay_hint cannot be negative.");
+		GUC_check_errmsg("commit_delay_hint must not be negative.");
+		GUC_check_errdetail("Value given: %d us.", *newval);
 		return false;
 	}
-	/* Actual clamping to [CommitDelayMin, CommitDelayMax] occurs in assign hook */
+	if (*newval > GUC_MAX_COMMIT_DELAY)
+	{
+		GUC_check_errmsg("commit_delay_hint must not exceed %d microseconds.", GUC_MAX_COMMIT_DELAY);
+		GUC_check_errdetail("Value given: %d us.", *newval);
+		return false;
+	}
+	/* Clamping against commit_delay_min/max happens in update_commit_delay_hint_clamped() */
 	return true;
 }
 
@@ -6059,15 +6135,8 @@ check_commit_delay_hint(int *newval, void **extra, GucSource source)
 static void
 assign_commit_delay_hint(int newval, void *extra)
 {
-	/*
-	 * The global GUC variable CommitDelayHint is already updated to newval by the GUC framework.
-	 * This variable stores the user's *preference*.
-	 * We now update the *clamped* value in MyProc.
-	 */
-	if (MyProc) /* Only relevant in a backend process */
-	{
-		MyProc->commit_delay_hint_clamped = clamp(newval, CommitDelayMin, CommitDelayMax);
-	}
+	/* The GUC C-variable commit_delay_hint has already been set to newval by the GUC framework. */
+	update_commit_delay_hint_clamped();
 }
 
 

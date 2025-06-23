@@ -552,9 +552,9 @@ int			temp_file_limit = -1;
 int			num_temp_buffers = 1024;
 
 /* User-settable parameters for commit delay */
-int			CommitDelayMin = 0;		/* min allowed commit delay for a session */
-int			CommitDelayMax = 0;		/* max allowed commit delay for a session */
-int			CommitDelayHint = 0;	/* session-level desired commit delay */
+int			commit_delay_min = 0;		/* min allowed commit delay for a session */
+int			commit_delay_max = 0;		/* max allowed commit delay for a session */
+int			commit_delay_hint = 0;	/* session-level desired commit delay */
 
 char	   *cluster_name = "";
 char	   *ConfigFileName;
@@ -3137,30 +3137,28 @@ struct config_int ConfigureNamesInt[] =
 	{
 		{"commit_delay_min", PGC_SIGHUP, WAL_SETTINGS,
 			gettext_noop("Minimum commit delay in microseconds for a session."),
-			gettext_noop("0 disables this minimum. Superuser only."),
-			GUC_UNIT_US /* Assuming GUC_UNIT_US exists or will be added; using GUC_UNIT_MS as placeholder if not */
+			gettext_noop("0 disables this minimum. Superuser only.")
+			/* Units are implicitly microseconds, handled by check/assign functions */
 		},
-		&CommitDelayMin,
+		&commit_delay_min,
 		0, 0, 100000, /* Max value from original CommitDelay */
 		check_commit_delay_min, assign_commit_delay_min, NULL
 	},
 	{
 		{"commit_delay_max", PGC_SIGHUP, WAL_SETTINGS,
 			gettext_noop("Maximum commit delay in microseconds for a session."),
-			gettext_noop("0 means no explicit maximum other than commit_delay_hint's own cap. Superuser only."),
-			GUC_UNIT_US
+			gettext_noop("0 means no explicit maximum other than commit_delay_hint's own cap. Superuser only.")
 		},
-		&CommitDelayMax,
+		&commit_delay_max,
 		0, 0, 100000, /* Max value from original CommitDelay */
 		check_commit_delay_max, assign_commit_delay_max, NULL
 	},
 	{
 		{"commit_delay_hint", PGC_USERSET, WAL_SETTINGS,
 			gettext_noop("Desired commit delay in microseconds for the current session."),
-			gettext_noop("Actual delay will be clamped by commit_delay_min and commit_delay_max."),
-			GUC_UNIT_US
+			gettext_noop("Actual delay will be clamped by commit_delay_min and commit_delay_max.")
 		},
-		&CommitDelayHint,
+		&commit_delay_hint,
 		0, 0, 100000, /* Max value from original CommitDelay */
 		check_commit_delay_hint, assign_commit_delay_hint, NULL
 	},

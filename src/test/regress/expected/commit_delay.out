@@ -560,19 +560,19 @@ SHOW commit_delay;        -- 7000
  7000
 (1 row)
 
-SHOW commit_delay_min;   -- Should become 7000 (clamped by its own 0-100000 range if needed, but not by another GUC yet)
+SHOW commit_delay_min;   -- Should be 0 (default, does not track CommitDelay)
  commit_delay_min 
 --------------------
- 7000
+ 0
 (1 row)
 
-SHOW commit_delay_max;   -- Should become 7000
+SHOW commit_delay_max;   -- Should be 0 (default, does not track CommitDelay)
  commit_delay_max 
 --------------------
- 7000
+ 0
 (1 row)
 
-SHOW commit_delay_hint;  -- Should become 7000
+SHOW commit_delay_hint;  -- Should become 7000 (as its default source is CommitDelay)
  commit_delay_hint 
 ---------------------
  7000
@@ -593,19 +593,19 @@ SHOW commit_delay;        -- 7000
  7000
 (1 row)
 
-SHOW commit_delay_max;   -- 7000 (still from commit_delay's influence)
+SHOW commit_delay_max;   -- Should be 0 (default, does not track CommitDelay)
  commit_delay_max 
 --------------------
- 7000
+ 0
 (1 row)
 
-SHOW commit_delay_hint;  -- 7000 (still from commit_delay's influence)
+SHOW commit_delay_hint;  -- Should be 7000 (still effectively from CommitDelay)
  commit_delay_hint 
 ---------------------
  7000
 (1 row)
 
-                         -- MyProc->commit_delay_hint_clamped should be 7000 (clamped by min(1000) and max(7000))
+                         -- MyProc->commit_delay_hint_clamped should be 7000 (clamped by min(1000) and max(0 means no upper bound from here))
 
 -- If we then set commit_delay to something lower than the new explicit min
 SET commit_delay = 500;
@@ -622,13 +622,13 @@ SHOW commit_delay_min;  -- 1000 (explicit)
  1000
 (1 row)
 
-SHOW commit_delay_max;  -- 7000 (from previous commit_delay influence, as it's not explicitly set)
+SHOW commit_delay_max;  -- Should be 0 (default, does not track CommitDelay)
  commit_delay_max 
 --------------------
- 7000
+ 0
 (1 row)
 
-SHOW commit_delay_hint; -- 500 (from commit_delay influence)
+SHOW commit_delay_hint; -- Should be 500 (effectively from CommitDelay)
  commit_delay_hint 
 ---------------------
  500
@@ -653,10 +653,10 @@ SHOW commit_delay_min;  -- 1500
  1500
 (1 row)
 
-SHOW commit_delay_hint; -- Should be 1500 (as it was default 0, now takes new min)
+SHOW commit_delay_hint; -- Should be 0 (commit_delay_hint GUC is not changed by setting commit_delay_min)
  commit_delay_hint 
 ---------------------
- 1500
+ 0
 (1 row)
 
 RESET commit_delay_min;
