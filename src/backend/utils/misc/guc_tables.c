@@ -638,6 +638,33 @@ char	   *role_string;
 /* should be static, but guc.c needs to get at this */
 bool		in_hot_standby_guc;
 
+/* WAL_SETTINGS GUCs */
+int			wal_segment_size = DEFAULT_XLOG_SEG_SIZE; /* PGC_INTERNAL */
+int			min_wal_size_mb = DEFAULT_MIN_WAL_SEGS * (DEFAULT_XLOG_SEG_SIZE / (1024 * 1024));
+int			max_wal_size_mb = DEFAULT_MAX_WAL_SEGS * (DEFAULT_XLOG_SEG_SIZE / (1024 * 1024));
+int			wal_keep_size_mb = 0;
+int			max_slot_wal_keep_size_mb = -1;
+int			XLOGbuffers = -1;
+int			XLogArchiveTimeout = 0;
+int			wal_retrieve_retry_interval = 5000;
+char	   *XLogArchiveCommand = "";
+bool		EnableHotStandby = true;
+bool		fullPageWrites = true;
+bool		wal_log_hints = false;
+int			wal_compression = WAL_COMPRESSION_NONE;
+bool		wal_init_zero = true;
+bool		wal_recycle = true;
+bool	   *wal_consistency_checking = NULL;
+char	   *wal_consistency_checking_string = "";
+bool		log_checkpoints = true;
+int			CommitDelay = 0;
+int			CommitDelayMin = 0;
+int			CommitDelayMax = 0;
+int			CommitDelayHint = 0;
+int			CommitSiblings = 5;
+bool		track_wal_io_timing = false;
+int			wal_decode_buffer_size = 512 * 1024;
+
 
 /*
  * Displayable names for context types (enum GucContext)
@@ -3108,7 +3135,7 @@ struct config_int ConfigureNamesInt[] =
 	},
 
 	{
-		{"commit_delay", PGC_SUSET, WAL_SETTINGS,
+		{"commit_delay", PGC_USERSET, WAL_SETTINGS,
 			gettext_noop("Sets the delay in microseconds between transaction commit and "
 						 "flushing WAL to disk."),
 			NULL
@@ -3116,7 +3143,7 @@ struct config_int ConfigureNamesInt[] =
 		},
 		&CommitDelay,
 		0, 0, 100000,
-		NULL, NULL, NULL
+		NULL, NULL, NULL // Keep original hooks for commit_delay if any, or NULL if none
 	},
 
 	{
@@ -3127,7 +3154,37 @@ struct config_int ConfigureNamesInt[] =
 		},
 		&CommitSiblings,
 		5, 0, 1000,
-		NULL, NULL, NULL
+		NULL, NULL, NULL // Keep original hooks for commit_siblings if any, or NULL if none
+	},
+
+	{
+		{"commit_delay_min", PGC_SIGHUP, WAL_SETTINGS,
+			gettext_noop("Minimum allowed value in microseconds for the group commit delay set in a session."),
+			gettext_noop("If a session specifies a value lower than commit_delay_min it is silently capped to commit_delay_min. Must be 0 <= commit_delay_min <= 100000 and commit_delay_min <= commit_delay_max."),
+		},
+		&CommitDelayMin,
+		0, 0, 100000,
+		check_commit_delay_min, assign_commit_delay_min, NULL
+	},
+
+	{
+		{"commit_delay_max", PGC_SIGHUP, WAL_SETTINGS,
+			gettext_noop("Maximum allowed value in microseconds for the group commit delay set in a session."),
+			gettext_noop("If a session specifies a value higher than commit_delay_max it is silently capped to commit_delay_max. Must be commit_delay_min <= commit_delay_max <= 100000. A value of 0 means no explicit maximum beyond commit_delay_hint's own check against 100000."),
+		},
+		&CommitDelayMax,
+		0, 0, 100000,
+		check_commit_delay_max, assign_commit_delay_max, NULL
+	},
+
+	{
+		{"commit_delay_hint", PGC_USERSET, WAL_SETTINGS,
+			gettext_noop("Session hint for desired commit delay in microseconds. Effective value is clamped by commit_delay_min and commit_delay_max."),
+			gettext_noop("The actual commit delay used by the backend for this session will be this value clamped between commit_delay_min and commit_delay_max. This effective clamped value influences the backend's willingness to wait during group commit."),
+		},
+		&CommitDelayHint,
+		0, 0, 100000, // User can set hint up to 100000, but it will be clamped by effective max.
+		check_commit_delay_hint, assign_commit_delay_hint, NULL
 	},
 
 	{

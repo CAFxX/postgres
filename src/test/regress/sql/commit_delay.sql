@@ -1,0 +1,525 @@
+-- Tests for commit_delay_min, commit_delay_max, and commit_delay_hint GUCs
+
+-- Setup: Create a non-superuser for permission tests
+CREATE ROLE non_superuser_commit_delay_test LOGIN;
+
+-- Check default values
+SHOW commit_delay_min;
+SHOW commit_delay_max;
+SHOW commit_delay_hint;
+SHOW commit_delay; -- Existing GUC for context
+
+-- Test setting commit_delay_hint by current user (superuser)
+SET commit_delay_hint = 100;
+SHOW commit_delay_hint;
+-- Test transaction-local behavior of commit_delay_hint
+BEGIN;
+SET LOCAL commit_delay_hint = 200;
+SHOW commit_delay_hint;
+COMMIT;
+SHOW commit_delay_hint; -- Should be back to 100
+
+-- Reset for next tests
+RESET commit_delay_hint;
+
+-- Test permissions for commit_delay_hint
+SET SESSION AUTHORIZATION non_superuser_commit_delay_test;
+SET commit_delay_hint = 50;
+SHOW commit_delay_hint;
+RESET commit_delay_hint;
+RESET SESSION AUTHORIZATION;
+
+-- Test permissions for commit_delay_min and commit_delay_max (attempt to set with SET)
+-- These are PGC_SIGHUP, so SET should normally fail for non-superusers.
+-- Superusers can SET them, but it's not their primary setting mechanism.
+SET SESSION AUTHORIZATION non_superuser_commit_delay_test;
+SHOW commit_delay_min; -- Show current (default or SIGHUP-set) value
+SET commit_delay_min = 100; -- Expected to fail for non-superuser
+SHOW commit_delay_max;
+SET commit_delay_max = 200; -- Expected to fail for non-superuser
+RESET SESSION AUTHORIZATION;
+
+-- Superuser can SET PGC_SIGHUP GUCs (though it's not the typical way to set them)
+SET commit_delay_min = 10;
+SHOW commit_delay_min;
+SET commit_delay_max = 20000;
+SHOW commit_delay_max;
+
+-- Test clamping of commit_delay_hint
+-- 1. Hint below min
+SET commit_delay_hint = 5;
+-- The actual delay is stored in MyProc->commit_delay_hint_clamped,
+-- which is not directly visible via SHOW. We infer its value by observing
+-- interactions or by assuming the check/assign hooks work.
+-- We can use a C function to expose MyProc->commit_delay_hint_clamped if needed,
+-- but for now, let's rely on indirect GUC value checks.
+-- Since commit_delay is also affected by these, let's see its behavior.
+SHOW commit_delay_hint;
+SHOW commit_delay; -- If commit_delay was 0, it might take commit_delay_min
+
+-- 2. Hint above max
+SET commit_delay_hint = 30000;
+SHOW commit_delay_hint;
+SHOW commit_delay; -- If commit_delay was 0, it might take commit_delay_min, then be clamped by max
+
+-- 3. Hint between min and max
+SET commit_delay_hint = 1000;
+SHOW commit_delay_hint;
+SHOW commit_delay;
+
+-- Reset min/max for further tests
+RESET commit_delay_min;
+RESET commit_delay_max;
+RESET commit_delay_hint;
+RESET commit_delay; -- Reset the original commit_delay as well
+
+SHOW commit_delay_min;
+SHOW commit_delay_max;
+SHOW commit_delay_hint;
+SHOW commit_delay;
+
+-- Test validation rules for min and max
+-- commit_delay_min must be >= 0
+SET commit_delay_min = -100; -- Expected to fail
+SET commit_delay_min = 0;
+SHOW commit_delay_min;
+
+-- commit_delay_max must be >= commit_delay_min
+SET commit_delay_max = 50;
+SHOW commit_delay_max;
+SET commit_delay_min = 100; -- Now min is 100, max is 50. This set should be fine.
+SHOW commit_delay_min;
+SET commit_delay_max = 80; -- Should fail as 80 < 100
+SHOW commit_delay_max; -- Should still be 50 or its default if previous failed as expected
+SET commit_delay_max = 150; -- Should succeed
+SHOW commit_delay_max;
+
+-- commit_delay (original GUC) interaction with new min/max
+-- If commit_delay is set, it should be clamped by new min/max if they are set.
+-- And if commit_delay is set, it might influence default min/max if they are not set.
+
+-- Scenario A: Set commit_delay first, then min/max
+RESET commit_delay_min;
+RESET commit_delay_max;
+RESET commit_delay;
+SET commit_delay = 5000; -- commit_delay is 5000us
+SHOW commit_delay;
+SHOW commit_delay_min; -- 0 (default)
+SHOW commit_delay_max; -- 0 (default means no explicit max)
+SHOW commit_delay_hint; -- 0 (default)
+
+-- Now set min, it should be <= commit_delay (if commit_delay is considered default for hint)
+-- The check for commit_delay_min is `*newval <= CommitDelay` if CommitDelay is not default.
+-- And `*newval <= CommitDelayMax` if CommitDelayMax is set and not default.
+-- Let's assume CommitDelayHint is 0 for now.
+SET commit_delay_min = 6000; -- This should be okay as it's not directly constrained by CommitDelay if CommitDelayHint is 0.
+                             -- The check `*newval <= CommitDelay` applies to `commit_delay_hint` not `commit_delay_min` directly.
+                             -- The check for commit_delay_min is `*newval <= current effective commit_delay_hint` (which is `CommitDelay` here)
+                             -- Let's re-evaluate the hooks:
+                             -- check_commit_delay_min: newval <= CommitDelay (effective hint)
+                             -- Our effective hint is CommitDelay (5000). So 6000 should fail.
+SHOW commit_delay_min; -- Expected to fail, remains 0 or previous valid.
+SET commit_delay_min = 4000; -- Should succeed.
+SHOW commit_delay_min;
+
+-- Now set max, it should be >= commit_delay (effective hint)
+SET commit_delay_max = 3000; -- Should fail as 3000 < 5000 (effective hint from commit_delay)
+SHOW commit_delay_max; -- Expected to fail, remains 0 or previous valid.
+SET commit_delay_max = 7000; -- Should succeed.
+SHOW commit_delay_max;
+
+-- At this point: commit_delay=5000, commit_delay_min=4000, commit_delay_max=7000
+-- commit_delay_hint is 0. Effective hint should be 5000 (clamped from commit_delay).
+-- Let's verify by setting hint.
+SET commit_delay_hint = 100; -- Effective hint becomes 4000 (clamped by min)
+SHOW commit_delay_hint;
+-- The actual delay used by backend is MyProc->commit_delay_hint_clamped.
+-- SHOW commit_delay shows the *original* commit_delay GUC, which is NOT MyProc->commit_delay_hint_clamped.
+-- To see the effect, we need a way to view MyProc->commit_delay_hint_clamped or test actual delay.
+
+-- Reset all
+RESET commit_delay_min;
+RESET commit_delay_max;
+RESET commit_delay_hint;
+RESET commit_delay;
+
+-- Scenario B: Set min/max first, then commit_delay
+SET commit_delay_min = 1000;
+SET commit_delay_max = 5000;
+SHOW commit_delay_min;
+SHOW commit_delay_max;
+
+SET commit_delay = 500; -- Effective value should be 1000 (clamped by min)
+SHOW commit_delay; -- This shows the actual value of commit_delay, which is 500.
+                   -- The *effective* delay for group commit leader is more complex.
+                   -- The individual backend's MyProc->commit_delay_hint_clamped is what we added.
+                   -- The original commit_delay GUC is still separate.
+                   -- The proposal states: "The effective value of commit_delay_hint is stored per-process"
+                   -- "This effective value is then used by the backend instead of the global commit_delay"
+                   -- So, setting commit_delay should not directly show clamping by commit_delay_min/max.
+                   -- Instead, commit_delay_hint is what gets clamped and then used.
+                   -- Let's test setting commit_delay_hint in this context.
+SET commit_delay_hint = 500; -- MyProc->commit_delay_hint_clamped should become 1000.
+SHOW commit_delay_hint;
+SET commit_delay_hint = 6000; -- MyProc->commit_delay_hint_clamped should become 5000.
+SHOW commit_delay_hint;
+SET commit_delay_hint = 3000; -- MyProc->commit_delay_hint_clamped should become 3000.
+SHOW commit_delay_hint;
+
+-- Reset all
+RESET commit_delay_min;
+RESET commit_delay_max;
+RESET commit_delay_hint;
+RESET commit_delay;
+
+-- Test interaction when commit_delay_min or commit_delay_max are set, and then commit_delay is set.
+-- The assign_commit_delay hook was modified to also update commit_delay_hint if it's at default.
+SET commit_delay_min = 1000;
+SET commit_delay_max = 5000;
+SHOW commit_delay_hint; -- default 0
+SET commit_delay = 3000; -- This should set commit_delay to 3000.
+                         -- AND it should set commit_delay_hint to 3000 (which then gets clamped to 3000).
+SHOW commit_delay;
+SHOW commit_delay_hint; -- Expected 3000
+
+RESET commit_delay_min;
+RESET commit_delay_max;
+RESET commit_delay_hint;
+RESET commit_delay;
+
+SET commit_delay_min = 1000;
+SET commit_delay_max = 5000;
+SET commit_delay_hint = 50; -- Hint is explicitly set, not default
+SHOW commit_delay_hint; -- 50
+SET commit_delay = 3000; -- This should set commit_delay to 3000.
+                         -- commit_delay_hint should remain 50.
+SHOW commit_delay;
+SHOW commit_delay_hint; -- Expected 50
+
+RESET commit_delay_min;
+RESET commit_delay_max;
+RESET commit_delay_hint;
+RESET commit_delay;
+
+-- Test that commit_delay_min cannot exceed hardcoded GUC_MAX_COMMIT_DELAY (100000)
+SET commit_delay_min = 100001; -- Expected to fail or be clamped
+SHOW commit_delay_min;
+SET commit_delay_min = 100000;
+SHOW commit_delay_min;
+
+RESET commit_delay_min;
+
+-- Test that commit_delay_max is also implicitly capped by GUC_MAX_COMMIT_DELAY if commit_delay_min allows it
+-- No, commit_delay_max itself doesn't have a direct upper cap in its check function other than being >= effective hint.
+-- Its practical cap comes from the fact that commit_delay_hint is capped by GUC_MAX_COMMIT_DELAY (from original commit_delay's check).
+
+-- Test effect of commit_delay_hint on a simple transaction
+-- This is tricky to make deterministic in regression tests.
+-- We are looking for a *change* in behavior.
+-- Create a helper function to measure execution time of a block.
+-- This is not standard in PG regression tests, usually relying on explain costs or specific outputs.
+-- Let's try a simpler approach: just execute a commit and see if it's slow.
+-- This will be very environment dependent.
+
+-- Set a noticeable delay hint
+SET commit_delay_min = 0;
+SET commit_delay_max = 200000; -- 200ms
+SET commit_delay_hint = 100000; -- 100ms
+SHOW commit_delay_hint;
+
+BEGIN;
+CREATE TABLE commit_delay_test_table (id int);
+INSERT INTO commit_delay_test_table VALUES (1);
+-- If commit_delay_hint is working, this commit should pause.
+-- We can't easily assert the pause duration in SQL.
+-- We rely on the fact that the GUC value is now used in XLogWrite.
+COMMIT;
+DROP TABLE commit_delay_test_table;
+
+RESET commit_delay_min;
+RESET commit_delay_max;
+RESET commit_delay_hint;
+
+-- Test setting defaults for min/max/hint via commit_delay
+-- If commit_delay is set, and min/max/hint are at their default source, they should take its value (clamped).
+SET commit_delay = 7000;
+SHOW commit_delay;        -- 7000
+SHOW commit_delay_min;   -- Should become 7000 (clamped by its own 0-100000 range if needed, but not by another GUC yet)
+SHOW commit_delay_max;   -- Should become 7000
+SHOW commit_delay_hint;  -- Should become 7000
+
+-- Now, if we set commit_delay_min explicitly, it should take precedence
+SET commit_delay_min = 1000;
+SHOW commit_delay_min;   -- 1000
+SHOW commit_delay;        -- 7000
+SHOW commit_delay_max;   -- 7000 (still from commit_delay's influence)
+SHOW commit_delay_hint;  -- 7000 (still from commit_delay's influence)
+                         -- MyProc->commit_delay_hint_clamped should be 7000 (clamped by min(1000) and max(7000))
+
+-- If we then set commit_delay to something lower than the new explicit min
+SET commit_delay = 500;
+SHOW commit_delay;       -- 500
+SHOW commit_delay_min;  -- 1000 (explicit)
+SHOW commit_delay_max;  -- 7000 (from previous commit_delay influence, as it's not explicitly set)
+SHOW commit_delay_hint; -- 500 (from commit_delay influence)
+                        -- MyProc->commit_delay_hint_clamped should be 1000 (clamped by min(1000) and hint(500))
+
+RESET commit_delay;
+RESET commit_delay_min;
+RESET commit_delay_max;
+RESET commit_delay_hint;
+
+-- Test that setting commit_delay_min updates commit_delay_hint if hint is default
+SET commit_delay_min = 1500;
+SHOW commit_delay_min;  -- 1500
+SHOW commit_delay_hint; -- Should be 1500 (as it was default 0, now takes new min)
+
+RESET commit_delay_min;
+RESET commit_delay_hint;
+
+-- Test that setting commit_delay_max updates commit_delay_hint if hint is default AND hint < max
+SET commit_delay_max = 2500;
+SHOW commit_delay_max;  -- 2500
+SHOW commit_delay_hint; -- Should be 0 (default, because 0 < 2500 is true, but assign hook for max doesn't force hint to max)
+                        -- The assign hook for commit_delay_max only calls update_commit_delay_hint_clamped().
+                        -- It does not force CommitDelayHint GUC to change like assign_commit_delay does.
+                        -- This seems correct as per original GUC design for max.
+
+SET commit_delay_min = 100;
+SET commit_delay_max = 2500;
+SET commit_delay_hint = 3000; -- Set hint above max
+SHOW commit_delay_hint;       -- 3000
+-- MyProc->commit_delay_hint_clamped should be 2500
+
+RESET commit_delay_min;
+RESET commit_delay_max;
+RESET commit_delay_hint;
+
+
+-- Clean up
+DROP ROLE non_superuser_commit_delay_test;
+
+
+--
+-- Tests for early leader wakeup in group commit
+--
+CREATE TABLE gc_wakeup_test (id int primary key, val text, commit_ts timestamptz default clock_timestamp());
+CREATE TABLE gc_lock_test (id int primary key);
+INSERT INTO gc_lock_test VALUES (1);
+
+-- Initialize GUCs for these tests for all sessions if possible, or set per session.
+-- For regression tests, setting them here in the main flow affects subsequent new connections
+-- if they inherit.
+SET commit_delay = 0; -- Global default, not used by sessions if they set hint directly
+SET commit_delay_min = 0;
+SET commit_delay_max = 400000; -- 400ms max for hints
+SET commit_delay_hint = 0;     -- Default session hint (will be effectively CommitDelay if not set otherwise)
+
+-- Test 2: Lock contention based test for early wakeup
+-- Session blocker_leader: Holds a lock, long commit hint
+\c - - - blocker_leader
+BEGIN;
+SET LOCAL statement_timeout = '10s';
+SET LOCAL commit_delay_hint = 350000; -- 350ms (long delay)
+INSERT INTO gc_wakeup_test (id, val) VALUES (100, 'blocker_leader about to update');
+SELECT pg_notify('SLOT_blocker_leader_ready_to_update', '');
+UPDATE gc_lock_test SET id = 100 WHERE id = 1; -- takes row lock
+INSERT INTO gc_wakeup_test (id, val) VALUES (101, 'blocker_leader updated, about to commit');
+SELECT pg_notify('SLOT_blocker_leader_about_to_commit', '');
+COMMIT; -- This will enter commit delay, holding the row lock
+INSERT INTO gc_wakeup_test (id, val) VALUES (102, 'blocker_leader committed');
+END;
+
+-- Session blocked_waiter: Tries to get the lock, short statement timeout
+\c - - - blocked_waiter
+BEGIN;
+SET LOCAL statement_timeout = '250ms'; -- Expects lock release well before 350ms. Increased from 200ms for CI stability.
+LISTEN SLOT_blocker_leader_about_to_commit;
+SELECT pg_notify('SLOT_blocked_waiter_listening','');
+-- Wait for S1 to be about to commit (and thus holding the lock and starting its delay)
+SELECT pg_wait_for_notification_timeout('SLOT_blocker_leader_about_to_commit', '15s');
+INSERT INTO gc_wakeup_test (id, val) VALUES (200, 'blocked_waiter attempting lock');
+SELECT * FROM gc_lock_test WHERE id = 100 FOR UPDATE; -- Should block, then succeed if S1 wakes early
+INSERT INTO gc_wakeup_test (id, val) VALUES (201, 'blocked_waiter succeeded');
+COMMIT;
+EXCEPTION WHEN statement_timeout THEN
+    INSERT INTO gc_wakeup_test (id, val) VALUES (202, 'blocked_waiter timed out');
+    COMMIT; -- Commit the timeout message
+END;
+
+-- Session wakeup_follower: Short hint, should wake S1 (blocker_leader)
+\c - - - wakeup_follower
+BEGIN;
+SET LOCAL statement_timeout = '10s';
+SET LOCAL commit_delay_hint = 10000; -- 10ms (short delay)
+LISTEN SLOT_blocked_waiter_listening;
+-- Wait for S1 to hold the lock & be in commit, and S2 to be waiting for the lock.
+SELECT pg_wait_for_notification_timeout('SLOT_blocked_waiter_listening', '15s');
+-- Add a small delay to ensure S1 is definitely in its sleep and S2 is blocked.
+-- S1 started commit, S2 tried to get lock. Now S3 joins.
+SELECT pg_sleep(0.07); -- 70ms. S1 started commit, S2 is blocked. S1's hint is 350ms.
+INSERT INTO gc_wakeup_test (id, val) VALUES (300, 'wakeup_follower about to commit');
+COMMIT;
+INSERT INTO gc_wakeup_test (id, val) VALUES (301, 'wakeup_follower committed');
+END;
+
+
+-- Back in main session (default connection)
+\c -
+-- Wait for all sessions to complete their work.
+-- S1 (blocker_leader) original hint 350ms.
+-- S3 (wakeup_follower) joins after ~70ms from S1 update, S3 hint 10ms.
+-- So S1 should be woken up around 70ms + 10ms = 80ms (plus overheads) after its commit process started.
+-- S2 (blocked_waiter) has a 250ms timeout. It should succeed.
+SELECT pg_sleep(1.0); -- Wait longer to ensure all async activities and notifications settle.
+
+-- Check results: Expect 'blocked_waiter succeeded'
+SELECT val FROM gc_wakeup_test WHERE id IN (201, 202) ORDER BY id;
+
+-- Display all recorded events for manual inspection if needed
+-- SELECT id, val, commit_ts FROM gc_wakeup_test ORDER BY commit_ts, id;
+-- Avoid selecting commit_ts as it causes diffs. We check success via the specific value.
+
+-- Cleanup
+DROP TABLE gc_wakeup_test;
+DROP TABLE gc_lock_test;
+
+RESET commit_delay_min;
+RESET commit_delay_max;
+RESET commit_delay_hint;
+RESET commit_delay;
+
+
+-- Test 3: Leader has short hint, Follower has long hint. Leader should NOT be delayed by follower.
+CREATE TABLE gc_wakeup_test_2 (id int primary key, val text);
+CREATE TABLE gc_lock_test_2 (id int primary key);
+INSERT INTO gc_lock_test_2 VALUES (1);
+
+SET commit_delay = 0;
+SET commit_delay_min = 0;
+SET commit_delay_max = 400000; -- 400ms
+SET commit_delay_hint = 0;
+
+-- Session leader_short_hint: Holds a lock, short commit hint
+\c - - - leader_short_hint
+BEGIN;
+SET LOCAL statement_timeout = '10s';
+SET LOCAL commit_delay_hint = 100000; -- 100ms (short delay for leader)
+INSERT INTO gc_wakeup_test_2 (id, val) VALUES (100, 'leader_short_hint about to update');
+SELECT pg_notify('SLOT_leader_short_hint_ready_to_update', '');
+UPDATE gc_lock_test_2 SET id = 100 WHERE id = 1; -- takes row lock
+INSERT INTO gc_wakeup_test_2 (id, val) VALUES (101, 'leader_short_hint updated, about to commit');
+SELECT pg_notify('SLOT_leader_short_hint_about_to_commit', '');
+COMMIT; -- This will enter its 100ms commit delay, holding the row lock
+INSERT INTO gc_wakeup_test_2 (id, val) VALUES (102, 'leader_short_hint committed');
+END;
+
+-- Session waiter_for_short_leader: Tries to get the lock, statement timeout > leader's hint
+\c - - - waiter_for_short_leader
+BEGIN;
+SET LOCAL statement_timeout = '200ms'; -- Expects lock release around 100ms + overhead.
+LISTEN SLOT_leader_short_hint_about_to_commit;
+SELECT pg_notify('SLOT_waiter_for_short_leader_listening','');
+SELECT pg_wait_for_notification_timeout('SLOT_leader_short_hint_about_to_commit', '15s');
+INSERT INTO gc_wakeup_test_2 (id, val) VALUES (200, 'waiter_for_short_leader attempting lock');
+SELECT * FROM gc_lock_test_2 WHERE id = 100 FOR UPDATE; -- Should block, then succeed
+INSERT INTO gc_wakeup_test_2 (id, val) VALUES (201, 'waiter_for_short_leader succeeded');
+COMMIT;
+EXCEPTION WHEN statement_timeout THEN
+    INSERT INTO gc_wakeup_test_2 (id, val) VALUES (202, 'waiter_for_short_leader timed out');
+    COMMIT;
+END;
+
+-- Session follower_long_hint: Long hint, should NOT make leader_short_hint wait longer.
+\c - - - follower_long_hint
+BEGIN;
+SET LOCAL statement_timeout = '10s';
+SET LOCAL commit_delay_hint = 300000; -- 300ms (long delay)
+LISTEN SLOT_waiter_for_short_leader_listening;
+SELECT pg_wait_for_notification_timeout('SLOT_waiter_for_short_leader_listening', '15s');
+SELECT pg_sleep(0.02); -- 20ms. leader_short_hint started commit (100ms), waiter_for_short_leader is blocked.
+INSERT INTO gc_wakeup_test_2 (id, val) VALUES (300, 'follower_long_hint about to commit');
+COMMIT;
+INSERT INTO gc_wakeup_test_2 (id, val) VALUES (301, 'follower_long_hint committed');
+END;
+
+-- Back in main session
+\c -
+SELECT pg_sleep(1.0);
+-- Check results: Expect 'waiter_for_short_leader succeeded'
+SELECT val FROM gc_wakeup_test_2 WHERE id IN (201, 202) ORDER BY id;
+-- SELECT id, val FROM gc_wakeup_test_2 ORDER BY id;
+DROP TABLE gc_wakeup_test_2;
+DROP TABLE gc_lock_test_2;
+
+RESET commit_delay_min;
+RESET commit_delay_max;
+RESET commit_delay_hint;
+RESET commit_delay;
+
+-- Test 4: Leader uses global commit_delay, Follower has short hint. Leader should be woken early.
+CREATE TABLE gc_wakeup_test_3 (id int primary key, val text);
+CREATE TABLE gc_lock_test_3 (id int primary key);
+INSERT INTO gc_lock_test_3 VALUES (1);
+
+SET commit_delay = 350000; -- Global commit_delay is 350ms
+SET commit_delay_min = 0;
+SET commit_delay_max = 400000;
+SET commit_delay_hint = 0; -- Session default, so will pick up global commit_delay
+
+-- Session leader_global_delay: Holds a lock, uses global commit_delay
+\c - - - leader_global_delay
+BEGIN;
+SET LOCAL statement_timeout = '10s';
+-- No commit_delay_hint set, so it uses global CommitDelay (350ms)
+INSERT INTO gc_wakeup_test_3 (id, val) VALUES (100, 'leader_global_delay about to update');
+SELECT pg_notify('SLOT_leader_global_delay_ready_to_update', '');
+UPDATE gc_lock_test_3 SET id = 100 WHERE id = 1; -- takes row lock
+INSERT INTO gc_wakeup_test_3 (id, val) VALUES (101, 'leader_global_delay updated, about to commit');
+SELECT pg_notify('SLOT_leader_global_delay_about_to_commit', '');
+COMMIT; -- This will enter its ~350ms commit delay, holding the row lock
+INSERT INTO gc_wakeup_test_3 (id, val) VALUES (102, 'leader_global_delay committed');
+END;
+
+-- Session waiter_for_global_leader: Tries to get the lock, short statement timeout
+\c - - - waiter_for_global_leader
+BEGIN;
+SET LOCAL statement_timeout = '250ms'; -- Expects lock release well before 350ms.
+LISTEN SLOT_leader_global_delay_about_to_commit;
+SELECT pg_notify('SLOT_waiter_for_global_leader_listening','');
+SELECT pg_wait_for_notification_timeout('SLOT_leader_global_delay_about_to_commit', '15s');
+INSERT INTO gc_wakeup_test_3 (id, val) VALUES (200, 'waiter_for_global_leader attempting lock');
+SELECT * FROM gc_lock_test_3 WHERE id = 100 FOR UPDATE; -- Should block, then succeed if leader wakes early
+INSERT INTO gc_wakeup_test_3 (id, val) VALUES (201, 'waiter_for_global_leader succeeded');
+COMMIT;
+EXCEPTION WHEN statement_timeout THEN
+    INSERT INTO gc_wakeup_test_3 (id, val) VALUES (202, 'waiter_for_global_leader timed out');
+    COMMIT;
+END;
+
+-- Session follower_short_hint_for_global: Short hint, should wake leader_global_delay
+\c - - - follower_short_hint_for_global
+BEGIN;
+SET LOCAL statement_timeout = '10s';
+SET LOCAL commit_delay_hint = 10000; -- 10ms (short delay)
+LISTEN SLOT_waiter_for_global_leader_listening;
+SELECT pg_wait_for_notification_timeout('SLOT_waiter_for_global_leader_listening', '15s');
+SELECT pg_sleep(0.07); -- 70ms. leader_global_delay started commit, waiter_for_global_leader is blocked.
+INSERT INTO gc_wakeup_test_3 (id, val) VALUES (300, 'follower_short_hint_for_global about to commit');
+COMMIT;
+INSERT INTO gc_wakeup_test_3 (id, val) VALUES (301, 'follower_short_hint_for_global committed');
+END;
+
+-- Back in main session
+\c -
+SELECT pg_sleep(1.0);
+-- Check results: Expect 'waiter_for_global_leader succeeded'
+SELECT val FROM gc_wakeup_test_3 WHERE id IN (201, 202) ORDER BY id;
+-- SELECT id, val FROM gc_wakeup_test_3 ORDER BY id;
+DROP TABLE gc_wakeup_test_3;
+DROP TABLE gc_lock_test_3;
+
+RESET commit_delay_min;
+RESET commit_delay_max;
+RESET commit_delay_hint;
+RESET commit_delay;

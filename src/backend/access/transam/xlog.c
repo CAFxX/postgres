@@ -561,6 +561,16 @@ typedef struct XLogCtlData
 	 */
 	XLogRecPtr	lastFpwDisableRecPtr;
 
+	/*
+	 * For per-session commit delay hints influencing group commit:
+	 * pending_group_min_hint_us: Min hint (us) of current/next group.
+	 *   UINT_MAX if no hint set by current/pending waiters. Protected by info_lck.
+	 * group_commit_leader_pid: PID of current leader sleeping for group commit.
+	 *   0 if no leader currently sleeping for group. Protected by info_lck.
+	 */
+	pg_atomic_uint32 pending_group_min_hint_us;
+	pg_atomic_uint32 group_commit_leader_pid;
+
 	slock_t		info_lck;		/* locks shared variables shown above */
 } XLogCtlData;
 
@@ -2951,6 +2961,53 @@ XLogFlush(XLogRecPtr record)
 			 LSN_FORMAT_ARGS(LogwrtResult.Flush));
 #endif
 
+	/*
+	 * Follower Behavior: If this backend has a shorter commit_delay_hint than
+	 * the current group's pending minimum, update the pending minimum and
+	 * attempt to wake the leader. This is done before trying to acquire
+	 * WALWriteLock, as this backend might not become the leader itself.
+	 * We only attempt to shorten if our hint is positive.
+	 */
+	if (MyProc->commit_delay_hint_clamped > 0)
+	{
+		uint32		my_hint_us = (uint32)MyProc->commit_delay_hint_clamped;
+		uint32		current_pending_min_hint_us_snapshot;
+
+		/* Read without lock first, for a quick check. This is an optimization. */
+		current_pending_min_hint_us_snapshot = pg_atomic_read_u32(&XLogCtl->pending_group_min_hint_us);
+
+		if (my_hint_us < current_pending_min_hint_us_snapshot)
+		{
+			SpinLockAcquire(&XLogCtl->info_lck);
+			/* Re-check under lock to ensure atomicity of update and leader notification */
+			if (my_hint_us < XLogCtl->pending_group_min_hint_us)
+			{
+				pg_atomic_write_u32(&XLogCtl->pending_group_min_hint_us, my_hint_us);
+				if (XLogCtl->group_commit_leader_pid != 0)
+				{
+					PGPROC *leader_proc = BackendPidGetProc(XLogCtl->group_commit_leader_pid);
+					if (leader_proc != NULL)
+					{
+						SetLatch(&leader_proc->procLatch);
+					}
+					else
+					{
+						/* Leader might have exited; clear stale PID if so.
+						 * This is a failsafe, leader cleanup is primary. */
+						pg_atomic_write_u32(&XLogCtl->group_commit_leader_pid, 0);
+						/* Potentially reset hint if we were the one who set it based on this stale leader */
+						/* pg_atomic_write_u32(&XLogCtl->pending_group_min_hint_us, UINT_MAX); */
+						/* On second thought, another follower might have a shorter hint,
+						 * or a new leader might emerge. Leave pending_group_min_hint_us as is,
+						 * it will be updated by the new leader or next follower.
+						 */
+					}
+				}
+			}
+			SpinLockRelease(&XLogCtl->info_lck);
+		}
+	}
+
 	START_CRIT_SECTION();
 
 	/*
@@ -2963,6 +3020,41 @@ XLogFlush(XLogRecPtr record)
 
 	/* initialize to given target; may increase below */
 	WriteRqstPtr = record;
+
+	/*
+	 * Follower Behavior: If this backend has a shorter commit_delay_hint than
+	 * the current group's pending minimum, update the pending minimum and
+	 * attempt to wake the leader. This is done before trying to acquire
+	 * WALWriteLock, as this backend might not become the leader itself.
+	 * We only attempt to shorten if our hint is positive.
+	 */
+	if (MyProc->commit_delay_hint_clamped > 0)
+	{
+		uint32		my_hint_us = (uint32)MyProc->commit_delay_hint_clamped;
+		uint32		current_pending_min_hint_us_snapshot;
+
+		/* Read without lock first, for a quick check. This is an optimization. */
+		current_pending_min_hint_us_snapshot = pg_atomic_read_u32(&XLogCtl->pending_group_min_hint_us);
+
+		if (my_hint_us < current_pending_min_hint_us_snapshot)
+		{
+			SpinLockAcquire(&XLogCtl->info_lck);
+			/* Re-check under lock to ensure atomicity of update and leader notification */
+			if (my_hint_us < pg_atomic_read_u32(&XLogCtl->pending_group_min_hint_us))
+			{
+				pg_atomic_write_u32(&XLogCtl->pending_group_min_hint_us, my_hint_us);
+				if (XLogCtl->group_commit_leader_pid != 0)
+				{
+					PGPROC *leader_proc = BackendPidGetProc(XLogCtl->group_commit_leader_pid);
+					if (leader_proc != NULL)
+					{
+						SetLatch(&leader_proc->procLatch);
+					}
+				}
+			}
+			SpinLockRelease(&XLogCtl->info_lck);
+		}
+	}
 
 	/*
 	 * Now wait until we get the write lock, or someone else does the flush
@@ -3021,20 +3113,164 @@ XLogFlush(XLogRecPtr record)
 		 * We do not sleep if enableFsync is not turned on, nor if there are
 		 * fewer than CommitSiblings other backends with active transactions.
 		 */
-		if (CommitDelay > 0 && enableFsync &&
+		/*
+		 * Sleep before flush! By adding a delay here, we may give further
+		 * backends the opportunity to join the backlog of group commit
+		 * followers; this can significantly improve transaction throughput,
+		 * at the risk of increasing transaction latency.
+		 *
+		 * We do not sleep if enableFsync is not turned on, nor if there are
+		 * fewer than CommitSiblings other backends with active transactions.
+		 * The actual delay amount is taken from MyProc->commit_delay_hint_clamped.
+		 */
+		if (MyProc->commit_delay_hint_clamped > 0 && enableFsync &&
 			MinimumActiveBackends(CommitSiblings))
 		{
-			pg_usleep(CommitDelay);
+			long		effective_delay_us;
+			bool		am_leader = false;
+			TimestampTz wait_start_time = 0;
 
 			/*
-			 * Re-check how far we can now flush the WAL. It's generally not
-			 * safe to call WaitXLogInsertionsToFinish while holding
-			 * WALWriteLock, because an in-progress insertion might need to
-			 * also grab WALWriteLock to make progress. But we know that all
-			 * the insertions up to insertpos have already finished, because
-			 * that's what the earlier WaitXLogInsertionsToFinish() returned.
-			 * We're only calling it again to allow insertpos to be moved
-			 * further forward, not to actually wait for anyone.
+			 * Try to become the group leader. If we succeed, or if there's
+			 * already a leader, determine the effective sleep duration.
+			 */
+			SpinLockAcquire(&XLogCtl->info_lck);
+			if (XLogCtl->group_commit_leader_pid == 0)
+			{
+				/* No leader, try to become one */
+				pg_atomic_write_u32(&XLogCtl->group_commit_leader_pid, MyProcPid);
+				am_leader = true;
+
+				/*
+				 * As the new leader, consider our own hint and any hint that
+				 * might have been set by a follower that arrived before us.
+				 */
+				effective_delay_us = MyProc->commit_delay_hint_clamped;
+				if (pg_atomic_read_u32(&XLogCtl->pending_group_min_hint_us) < effective_delay_us)
+					effective_delay_us = pg_atomic_read_u32(&XLogCtl->pending_group_min_hint_us);
+				else
+					pg_atomic_write_u32(&XLogCtl->pending_group_min_hint_us, effective_delay_us);
+			}
+			else
+			{
+				/*
+				 * There's already a leader. We won't sleep ourselves, but we
+				 * might have a shorter hint that could wake them up.
+				 * (This check is also done by followers before START_CRIT_SECTION,
+				 * but doing it here again handles the case where a new leader
+				 * emerged while we were in WaitXLogInsertionsToFinish or
+				 * LWLockAcquireOrWait for WALWriteLock).
+				 */
+				am_leader = false; /* We are not the leader */
+				effective_delay_us = 0; /* We won't sleep */
+
+				if (MyProc->commit_delay_hint_clamped < pg_atomic_read_u32(&XLogCtl->pending_group_min_hint_us))
+				{
+					pg_atomic_write_u32(&XLogCtl->pending_group_min_hint_us, MyProc->commit_delay_hint_clamped);
+					if (XLogCtl->group_commit_leader_pid != 0) /* Should still be true */
+					{
+						PGPROC *leader_proc = BackendPidGetProc(XLogCtl->group_commit_leader_pid);
+						if (leader_proc != NULL)
+							SetLatch(&leader_proc->procLatch);
+						else /* Leader vanished */
+							pg_atomic_write_u32(&XLogCtl->group_commit_leader_pid, 0);
+					}
+				}
+			}
+			SpinLockRelease(&XLogCtl->info_lck);
+
+			if (am_leader && effective_delay_us > 0)
+			{
+				/* We are the leader and need to sleep. */
+				wait_start_time = GetCurrentTimestamp();
+				ResetLatch(MyLatch);
+
+				for (;;)
+				{
+					long	remaining_delay_ms;
+					long	elapsed_us;
+					int		wl_rc;
+					uint32	current_pending_min_hint_us;
+
+					/* Recalculate remaining sleep time based on potentially updated effective_delay_us */
+					elapsed_us = TimestampDifferenceMicroseconds(wait_start_time, GetCurrentTimestamp());
+					if (elapsed_us < 0) /* Clock skew or time wrapped */
+						elapsed_us = 0;
+
+					if (elapsed_us >= effective_delay_us)
+						break; /* Original or shortened delay has passed */
+
+					remaining_delay_ms = (effective_delay_us - elapsed_us) / 1000;
+					if (remaining_delay_ms <= 0)
+						remaining_delay_ms = 1; /* Wait at least 1ms if there's any sub-ms delay left */
+
+					wl_rc = WaitLatch(MyLatch,
+									  WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+									  remaining_delay_ms,
+									  WAIT_EVENT_WAL_GROUP_DELAY); /* New wait event */
+
+					if (wl_rc & WL_LATCH_SET)
+					{
+						ResetLatch(MyLatch);
+						/* Latch was set. A follower might have a shorter hint. */
+						SpinLockAcquire(&XLogCtl->info_lck);
+						if (pg_atomic_read_u32(&XLogCtl->group_commit_leader_pid) != MyProcPid)
+						{
+							/* Lost leadership. Stop sleeping. */
+							am_leader = false; /* Not leader anymore */
+							SpinLockRelease(&XLogCtl->info_lck);
+							break;
+						}
+						current_pending_min_hint_us = pg_atomic_read_u32(&XLogCtl->pending_group_min_hint_us);
+						if (current_pending_min_hint_us < effective_delay_us)
+						{
+							effective_delay_us = current_pending_min_hint_us;
+							/* Loop again to re-evaluate sleep with new effective_delay_us */
+						}
+						SpinLockRelease(&XLogCtl->info_lck);
+						/* continue to check if new effective_delay_us is already met */
+						continue;
+					}
+
+					if (wl_rc & WL_TIMEOUT)
+					{
+						/* Timeout expired as expected. */
+						break;
+					}
+
+					if (wl_rc & WL_EXIT_ON_PM_DEATH)
+					{
+						/* Postmaster died. Clean up and exit. */
+						if (am_leader) /* Should still be true here */
+						{
+							SpinLockAcquire(&XLogCtl->info_lck);
+							if (pg_atomic_read_u32(&XLogCtl->group_commit_leader_pid) == MyProcPid)
+							{
+								pg_atomic_write_u32(&XLogCtl->group_commit_leader_pid, 0);
+								pg_atomic_write_u32(&XLogCtl->pending_group_min_hint_us, UINT_MAX);
+							}
+							SpinLockRelease(&XLogCtl->info_lck);
+						}
+						proc_exit(1);
+					}
+				} /* end leader sleep loop */
+			} /* end if (am_leader && effective_delay_us > 0) */
+
+			/* If we were the leader, clean up shared state. */
+			if (am_leader)
+			{
+				SpinLockAcquire(&XLogCtl->info_lck);
+				if (pg_atomic_read_u32(&XLogCtl->group_commit_leader_pid) == MyProcPid)
+				{
+					pg_atomic_write_u32(&XLogCtl->group_commit_leader_pid, 0);
+					pg_atomic_write_u32(&XLogCtl->pending_group_min_hint_us, UINT_MAX);
+				}
+				SpinLockRelease(&XLogCtl->info_lck);
+			}
+
+			/*
+			 * Re-check how far we can now flush the WAL, as more transactions
+			 * might have joined while we were sleeping (or determining leader).
 			 */
 			insertpos = WaitXLogInsertionsToFinish(insertpos);
 		}
@@ -5204,6 +5440,14 @@ XLOGShmemInit(void)
 	pg_atomic_init_u64(&XLogCtl->logWriteResult, InvalidXLogRecPtr);
 	pg_atomic_init_u64(&XLogCtl->logFlushResult, InvalidXLogRecPtr);
 	pg_atomic_init_u64(&XLogCtl->unloggedLSN, InvalidXLogRecPtr);
+
+	/*
+	 * For per-session commit delay hints influencing group commit.
+	 * pending_group_min_hint_us is initialized to UINT_MAX (no hint).
+	 * group_commit_leader_pid is initialized to 0 (no leader).
+	 */
+	pg_atomic_init_u32(&XLogCtl->pending_group_min_hint_us, UINT_MAX);
+	pg_atomic_init_u32(&XLogCtl->group_commit_leader_pid, 0);
 
 	pg_atomic_init_u64(&XLogCtl->InitializeReserved, InvalidXLogRecPtr);
 	pg_atomic_init_u64(&XLogCtl->InitializedUpTo, InvalidXLogRecPtr);

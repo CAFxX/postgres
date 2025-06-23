@@ -3595,7 +3595,83 @@ include_dir 'conf.d'
         was completed sooner.  Beginning in <productname>PostgreSQL</productname> 9.3,
         the first process that becomes ready to flush waits for the configured
         interval, while subsequent processes wait only until the leader
-        completes the flush operation.
+        completes the flush operation. The actual delay chosen by a group
+        commit leader can also be influenced by the
+        <varname>commit_delay_hint</varname> settings of participating
+        transactions.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-commit-delay-min" xreflabel="commit_delay_min">
+      <term><varname>commit_delay_min</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>commit_delay_min</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Minimum allowed value for <varname>commit_delay_hint</varname>.
+        If this value is specified without units, it is taken as microseconds.
+        The default is zero.
+        This parameter can only be set in <filename>postgresql.conf</filename>
+        or on the server command line. Requires superuser privileges to set.
+        Must be less than or equal to <varname>commit_delay_max</varname> if
+        <varname>commit_delay_max</varname> is not zero.
+        A value of 0 means no minimum limit. The effective commit delay for a
+        session will be clamped by this value. The allowed range is 0 to
+        100000 microseconds.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-commit-delay-max" xreflabel="commit_delay_max">
+      <term><varname>commit_delay_max</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>commit_delay_max</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Maximum allowed value for <varname>commit_delay_hint</varname>.
+        If this value is specified without units, it is taken as microseconds.
+        The default is zero.
+        This parameter can only be set in <filename>postgresql.conf</filename>
+        or on the server command line. Requires superuser privileges to set.
+        If not zero, must be greater than or equal to <varname>commit_delay_min</varname>.
+        A value of 0 effectively means no explicit maximum; the effective
+        maximum will then be the upper limit of <varname>commit_delay_hint</varname>
+        itself (100000 microseconds). Otherwise, the value must be between
+        0 and 100000 microseconds. The effective commit delay for a session
+        will be clamped by this value.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-commit-delay-hint" xreflabel="commit_delay_hint">
+      <term><varname>commit_delay_hint</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>commit_delay_hint</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Session-level hint for the desired commit delay.
+        If this value is specified without units, it is taken as microseconds.
+        The default is zero (no delay), and its effective value is capped at 100000 microseconds.
+        This value can be set by any user for their current session or transaction.
+        If <varname>commit_delay_hint</varname> is not explicitly set within a
+        session, its initial effective value is derived from the global
+        <varname>commit_delay</varname> setting, after being clamped by
+        <varname>commit_delay_min</varname> and
+        <varname>commit_delay_max</varname>.
+        The actual effective commit delay used by the backend for this session
+        will be this value clamped between <varname>commit_delay_min</varname>
+        and <varname>commit_delay_max</varname>.
+        This effective clamped value influences the backend's willingness to
+        wait during group commit, potentially allowing more transactions to
+        be flushed together. See <varname>commit_delay</varname> for more
+        details on group commit behavior.
        </para>
       </listitem>
      </varlistentry>

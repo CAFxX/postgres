@@ -520,6 +520,10 @@ InitProcess(void)
 	/* Initialize wait event information. */
 	MyProc->wait_event_info = 0;
 
+	/* Initialize per-session commit delay hint to global default */
+	/* This relies on CommitDelay GUC being initialized before InitProcess is called for a backend */
+	MyProc->commit_delay_hint_clamped = CommitDelay;
+
 	/* Initialize fields for group transaction status update. */
 	MyProc->clogGroupMember = false;
 	MyProc->clogGroupMemberXid = InvalidTransactionId;

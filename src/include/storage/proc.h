@@ -268,6 +268,9 @@ struct PGPROC
 	int			syncRepState;	/* wait state for sync rep */
 	dlist_node	syncRepLinks;	/* list link if process is in syncrep queue */
 
+	/* Per-session commit delay hint, actual value clamped by min/max */
+	int			commit_delay_hint_clamped;	/* microseconds */
+
 	/*
 	 * All PROCLOCK objects for locks held or awaited by this backend are
 	 * linked into one of these lists, according to the partition number of

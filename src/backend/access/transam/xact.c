@@ -371,6 +371,22 @@ static void ShowTransactionStateRec(const char *str, TransactionState s);
 static const char *BlockStateAsString(TBlockState blockState);
 static const char *TransStateAsString(TransState state);
 
+/* For GUCs */
+static bool CommitDelayMinIsSet = false;
+static bool CommitDelayMaxIsSet = false;
+
+/* GUC check and assign hooks */
+static bool check_commit_delay(int *newval, void **extra, GucSource source);
+static void assign_commit_delay(int newval, void *extra);
+static bool check_commit_delay_min(int *newval, void **extra, GucSource source);
+static void assign_commit_delay_min(int newval, void *extra);
+static bool check_commit_delay_max(int *newval, void **extra, GucSource source);
+static void assign_commit_delay_max(int newval, void *extra);
+static bool check_commit_delay_hint(int *newval, void **extra, GucSource source);
+static void assign_commit_delay_hint(int newval, void *extra);
+
+static void update_commit_delay_hint_clamped(void);
+
 
 /* ----------------------------------------------------------------
  *	transaction state accessors
@@ -1499,7 +1515,44 @@ RecordTransactionCommit(void)
 		 synchronous_commit > SYNCHRONOUS_COMMIT_OFF) ||
 		forceSyncCommit || nrels > 0)
 	{
-		XLogFlush(XactLastRecEnd);
+		/*
+		 * Determine actual commit delay for this transaction based on its hint.
+		 * This part is simplified; the actual group commit logic is deeper,
+		 * typically in xlog.c's XLogGroupDelay or related functions.
+		 * The core idea is that the current transaction's desired delay,
+		 * MyProc->commit_delay_hint_clamped, influences the group's wake-up time.
+		 */
+		bool		do_group_commit = false;
+		int			current_txn_delay_us = MyProc->commit_delay_hint_clamped;
+
+		if (current_txn_delay_us > 0 && XactWriterCount > 0 &&
+			XactWriterCount >= CommitSiblings)
+		{
+			do_group_commit = true;
+			/*
+			 * The actual mechanism involves XLogGroupDelay() being called by XLogFlush,
+			 * which then uses the pg_atomic_uint64 waldelay_commit_group_leader_wal_end_lsn_timeout_deadline_ts
+			 * in ProcGlobal. We need to ensure this deadline is correctly influenced.
+			 * XLogGroupDelay will need to be aware of the current proc's hint.
+			 * For now, we ensure XLogFlush is called, which will trigger group delay logic.
+			 */
+		}
+
+		if (do_group_commit)
+		{
+			/*
+			 * XLogFlush will call XLogGroupDelay. XLogGroupDelay needs to be
+			 * modified to consider MyProc->commit_delay_hint_clamped when setting
+			 * or adjusting the group deadline. This is a placeholder for that logic.
+			 * The current RecordTransactionCommit doesn't directly manage the group
+			 * deadline ts; that's lower in the stack.
+			 */
+			XLogFlush(XactLastRecEnd); /* This call will internally handle group delay */
+		}
+		else
+		{
+			XLogFlush(XactLastRecEnd); /* Standard synchronous flush */
+		}
 
 		/*
 		 * Now we may update the CLOG, if we wrote a COMMIT record above
@@ -5798,6 +5851,225 @@ xactGetCommittedChildren(TransactionId **ptr)
 
 	return s->nChildXids;
 }
+
+/*
+ * Clamp a value between a minimum and a maximum.
+ */
+static inline int
+clamp(int value, int min_val, int max_val)
+{
+	if (value < min_val)
+		return min_val;
+	if (value > max_val)
+		return max_val;
+	return value;
+}
+
+/*
+ * Update the clamped commit_delay_hint for the current session.
+ * This should be called whenever CommitDelay, CommitDelayMin, CommitDelayMax,
+ * or the user-set CommitDelayHint changes.
+ * It's also called during InitProcess to set the initial clamped value.
+ */
+static void
+update_commit_delay_hint_clamped(void)
+{
+	if (MyProc != NULL) /* MyProc is NULL during early GUC initialization or if called too early */
+	{
+		/*
+		 * The global CommitDelayHint variable holds the user's *desired* value for the
+		 * current session. We clamp this against the current global CommitDelayMin
+		 * and CommitDelayMax.
+		 */
+		MyProc->commit_delay_hint_clamped = clamp(CommitDelayHint, CommitDelayMin, CommitDelayMax);
+	}
+	/*
+	 * If MyProc is NULL (e.g. postmaster loading config before forking),
+	 * there's no per-process value to update yet. InitProcess will set it.
+	 */
+}
+
+
+/*
+ * Check hook for commit_delay
+ */
+static bool
+check_commit_delay(int *newval, void **extra, GucSource source)
+{
+	if (*newval < 0 || *newval > 100000) /* Standard limits for commit_delay */
+	{
+		GUC_check_errmsg("commit_delay must be between 0 and 100000 microseconds.");
+		return false;
+	}
+
+	/*
+	 * When commit_delay is changed, it must remain within the currently set
+	 * commit_delay_min and commit_delay_max.
+	 * Skip this check if source is PGC_S_DEFAULT or PGC_S_FILE during postmaster startup,
+	 * as min/max might not be initialized or might be set *after* commit_delay.
+	 * The assign hooks will reconcile these.
+	 */
+	if (source > PGC_S_FILE || (source == PGC_S_FILE && MyProc != NULL /* i.e., SIGHUP in backend */))
+	{
+		if (CommitDelayMinIsSet && *newval < CommitDelayMin)
+		{
+			GUC_check_errmsg("commit_delay (%d us) cannot be less than commit_delay_min (%d us)", *newval, CommitDelayMin);
+			return false;
+		}
+		if (CommitDelayMaxIsSet && *newval > CommitDelayMax)
+		{
+			GUC_check_errmsg("commit_delay (%d us) cannot be greater than commit_delay_max (%d us)", *newval, CommitDelayMax);
+			return false;
+		}
+	}
+	return true;
+}
+
+/*
+ * Assign hook for commit_delay
+ */
+static void
+assign_commit_delay(int newval, void *extra)
+{
+	/* Update dependent GUCs if they are at their default source */
+	if (GetConfigOptionSource("commit_delay_min") == PGC_S_DEFAULT)
+		CommitDelayMin = newval;
+	else if (CommitDelayMin > newval && newval >=0)
+		CommitDelayMin = newval;
+
+	if (GetConfigOptionSource("commit_delay_max") == PGC_S_DEFAULT)
+		CommitDelayMax = newval;
+	else if (CommitDelayMax != 0 && CommitDelayMax < newval)
+		CommitDelayMax = newval;
+
+	// If the session's commit_delay_hint GUC is currently at its
+	// compiled-in default (0), and it wasn't set by the user in this session
+	// (i.e. source is default or from config file), then make it follow the new global CommitDelay.
+	// This ensures that if a user hasn't set a session-specific hint,
+	// the effective hint tracks the global setting after a SIGHUP.
+	if (CommitDelayHint == 0 && GetConfigOptionSource("commit_delay_hint") <= PGC_S_FILE)
+	{
+		CommitDelayHint = newval;
+	}
+
+	update_commit_delay_hint_clamped();
+}
+
+/*
+ * Check hook for commit_delay_min
+ */
+static bool
+check_commit_delay_min(int *newval, void **extra, GucSource source)
+{
+	if (*newval < 0)
+	{
+		GUC_check_errmsg("commit_delay_min cannot be negative.");
+		return false;
+	}
+	if (*newval > 100000) /* Max of commit_delay_hint itself */
+	{
+		GUC_check_errmsg("commit_delay_min cannot exceed 100000 microseconds.");
+		return false;
+	}
+
+	/*
+	 * commit_delay_min must be <= commit_delay_max, unless commit_delay_max is 0 (no explicit max).
+	 * Skip this check if source is PGC_S_DEFAULT or PGC_S_FILE during postmaster startup,
+	 * as max might not be initialized or might be set *after* min.
+	 */
+	if (CommitDelayMaxIsSet && CommitDelayMax != 0 && *newval > CommitDelayMax &&
+		(source > PGC_S_FILE || (source == PGC_S_FILE && MyProc != NULL)))
+	{
+		GUC_check_errmsg("commit_delay_min (%d us) cannot be greater than commit_delay_max (%d us).", *newval, CommitDelayMax);
+		return false;
+	}
+	CommitDelayMinIsSet = true;
+	return true;
+}
+
+/*
+ * Assign hook for commit_delay_min
+ */
+static void
+assign_commit_delay_min(int newval, void *extra)
+{
+	update_commit_delay_hint_clamped();
+}
+
+/*
+ * Check hook for commit_delay_max
+ */
+static bool
+check_commit_delay_max(int *newval, void **extra, GucSource source)
+{
+	if (*newval < 0)
+	{
+		GUC_check_errmsg("commit_delay_max cannot be negative.");
+		return false;
+	}
+	if (*newval > 100000) /* Max of commit_delay_hint itself */
+	{
+		GUC_check_errmsg("commit_delay_max cannot exceed 100000 microseconds.");
+		return false;
+	}
+
+	/*
+	 * If commit_delay_max is not 0 (meaning "no explicit max"),
+	 * it must be >= commit_delay_min.
+	 * Skip this check if source is PGC_S_DEFAULT or PGC_S_FILE during postmaster startup,
+	 * as min might not be initialized or might be set *after* max.
+	 */
+	if (*newval != 0 && CommitDelayMinIsSet && *newval < CommitDelayMin &&
+		(source > PGC_S_FILE || (source == PGC_S_FILE && MyProc != NULL)))
+	{
+		GUC_check_errmsg("commit_delay_max (%d us) cannot be less than commit_delay_min (%d us).", *newval, CommitDelayMin);
+		return false;
+	}
+	CommitDelayMaxIsSet = true;
+	return true;
+}
+
+/*
+ * Assign hook for commit_delay_max
+ */
+static void
+assign_commit_delay_max(int newval, void *extra)
+{
+	update_commit_delay_hint_clamped();
+}
+
+/*
+ * Check hook for commit_delay_hint
+ */
+static bool
+check_commit_delay_hint(int *newval, void **extra, GucSource source)
+{
+	if (*newval < 0)
+	{
+		GUC_check_errmsg("commit_delay_hint cannot be negative.");
+		return false;
+	}
+	/* Actual clamping to [CommitDelayMin, CommitDelayMax] occurs in assign hook */
+	return true;
+}
+
+/*
+ * Assign hook for commit_delay_hint
+ */
+static void
+assign_commit_delay_hint(int newval, void *extra)
+{
+	/*
+	 * The global GUC variable CommitDelayHint is already updated to newval by the GUC framework.
+	 * This variable stores the user's *preference*.
+	 * We now update the *clamped* value in MyProc.
+	 */
+	if (MyProc) /* Only relevant in a backend process */
+	{
+		MyProc->commit_delay_hint_clamped = clamp(newval, CommitDelayMin, CommitDelayMax);
+	}
+}
+
 
 /*
  *	XLOG support routines

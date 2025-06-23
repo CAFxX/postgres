@@ -256,7 +256,14 @@
 #wal_skip_threshold = 2MB
 
 #commit_delay = 0			# range 0-100000, in microseconds
+#commit_delay_min = 0			# range 0-100000, in microseconds.
+					# Must be <= commit_delay_max (if commit_delay_max is not 0).
+#commit_delay_max = 0			# range 0-100000, in microseconds; 0 means no explicit max.
+					# If not 0, must be >= commit_delay_min.
 #commit_siblings = 5			# range 1-1000
+#commit_delay_hint = 0			# range 0-100000, in microseconds.
+					# If not set by user, initial effective value in a session is based on global commit_delay.
+					# Effective value is clamped by commit_delay_min and commit_delay_max.
 
 # - Checkpoints -
 
