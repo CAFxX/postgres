@@ -84,6 +84,19 @@
 #include <limits.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <errno.h>
+#ifdef _WIN32
+    #include <windows.h>
+    #include <winioctl.h>
+#elif defined(__FreeBSD__)
+    #include <sys/param.h>
+    #if __FreeBSD_version >= 1400000
+        #include <sys/spacectl.h>
+    #elif __FreeBSD_version < 1300000
+        #include <sys/ioctl.h>
+        #include <sys/disk.h>
+    #endif
+#endif
 
 #include "access/xact.h"
 #include "access/xlog.h"
@@ -2503,6 +2516,94 @@ FileTruncate(File file, off_t offset, uint32 wait_event_info)
 	return returnCode;
 }
 
+int
+FileDecommitRange(File file, off_t off, off_t size)
+{
+	Assert(FileIsValid(file));
+
+	DO_DB(elog(LOG, "FileDecommitRange: %d (%s) " INT64_FORMAT " " INT64_FORMAT,
+			   file, VfdCache[file].fileName,
+			   (int64) off, (int64) size));
+
+#if defined(__linux__)
+    return fallocate(VfdCache[file].fd, FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE, off, size);
+
+#elif defined(__illumos__)
+    return fallocate(VfdCache[file].fd, FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE, off, size);
+
+#elif defined(__ANDROID__) && __ANDROID_API__ >= 21
+    return fallocate(VfdCache[file].fd, FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE, off, size);
+
+#elif defined(__APPLE__)
+    fpunchhole_t args = {
+        .fp_flags = 0,
+        .fp_offset = off,
+        .fp_length = size
+    };
+    return fcntl(VfdCache[file].fd, F_PUNCHHOLE, &args);
+
+#elif defined(__sun) && defined(__SVR4)
+    struct flock fl = {
+        .l_whence = SEEK_SET,
+        .l_start = off,
+        .l_len = size,
+        .l_type = F_WRLCK
+    };
+    return fcntl(VfdCache[file].fd, F_FREESP, &fl);
+
+#elif defined(_WIN32) && _WIN32_WINNT >= 0x0600
+    FILE_ZERO_DATA_INFORMATION zdi;
+    DWORD bytesReturned;
+    HANDLE hFile = (HANDLE)_get_osfhandle(VfdCache[file].fd);
+    
+    if (hFile == INVALID_HANDLE_VALUE) {
+        errno = EBADF;
+        return -1;
+    }
+    
+    zdi.FileOffset.QuadPart = off;
+    zdi.BeyondFinalZero.QuadPart = off + size;
+    
+    if (!DeviceIoControl(hFile, FSCTL_SET_ZERO_DATA, &zdi, sizeof(zdi),
+                         NULL, 0, &bytesReturned, NULL)) {
+        /* Convert Windows error to errno */
+        _dosmaperr(GetLastError());
+        return -1;
+    }
+    return 0;
+
+#elif defined(__FreeBSD__)
+    #if __FreeBSD_version >= 1400000
+        struct spacectl_range range = {
+            .r_offset = off,
+            .r_len = size
+        };
+        return fspacectl(VfdCache[file].fd, SPACECTL_DEALLOC, &range, 0, NULL);
+    #elif __FreeBSD_version >= 1300000
+        return fdiscard(VfdCache[file].fd, off, size);
+    #elif __FreeBSD_version >= 700000
+        off_t range[2] = { off, size };
+        return ioctl(VfdCache[file].fd, DIOCGDELETE, range);
+    #endif
+
+#elif defined(__NetBSD__) && __NetBSD_Version__ >= 700000000
+    /* NetBSD 7.0+ has fdiscard */
+    return fdiscard(VfdCache[file].fd, off, size);
+
+#elif defined(_AIX) && defined(_AIX61)
+    /* AIX: Use fclear64 (requires seek first) */
+    if (lseek64(VfdCache[file].fd, off, SEEK_SET) == -1)
+        return -1;
+    
+    off64_t result = fclear64(VfdCache[file].fd, size);
+    return (result == -1) ? -1 : 0;
+
+#else
+    /* Unknown platform */
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
 /*
  * Return the pathname associated with an open file.
  *

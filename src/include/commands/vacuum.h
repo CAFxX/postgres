@@ -229,6 +229,7 @@ typedef struct VacuumParams
 									 * default */
 	VacOptValue index_cleanup;	/* Do index vacuum and cleanup */
 	VacOptValue truncate;		/* Truncate empty pages at the end */
+	VacOptValue decommit;		/* Try to decommit empty pages */
 	Oid			toast_parent;	/* for privilege checks when recursing */
 
 	/*

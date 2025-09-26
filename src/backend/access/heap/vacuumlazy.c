@@ -278,6 +278,8 @@ typedef struct LVRelState
 	bool		do_index_cleanup;
 	bool		do_rel_truncate;
 
+	bool        try_decommit_empty_pages;
+
 	/* VACUUM operation's cutoffs for freezing and pruning */
 	struct VacuumCutoffs cutoffs;
 	GlobalVisState *vistest;
@@ -701,6 +703,8 @@ heap_vacuum_rel(Relation rel, const VacuumParams params,
 	Assert(params.index_cleanup != VACOPTVALUE_UNSPECIFIED);
 	Assert(params.truncate != VACOPTVALUE_UNSPECIFIED &&
 		   params.truncate != VACOPTVALUE_AUTO);
+	Assert(params.decommit != VACOPTVALUE_UNSPECIFIED &&
+		   params.decommit != VACOPTVALUE_AUTO);
 
 	/*
 	 * While VacuumFailSafeActive is reset to false before calling this, we
@@ -727,6 +731,7 @@ heap_vacuum_rel(Relation rel, const VacuumParams params,
 		/* Default/auto, make all decisions dynamically */
 		Assert(params.index_cleanup == VACOPTVALUE_AUTO);
 	}
+	vacrel->try_decommit_empty_pages = params.decommit == VACOPTVALUE_ENABLED;
 
 	/* Initialize page counters explicitly (be tidy) */
 	vacrel->scanned_pages = 0;
@@ -1920,6 +1925,13 @@ cmpOffsetNumbers(const void *a, const void *b)
 	return pg_cmp_u16(*(const OffsetNumber *) a, *(const OffsetNumber *) b);
 }
 
+static void
+try_decommit_page(LVRelState *vacrel,
+				  BlockNumber blkno)
+{
+	FileDecommitRange(...)
+}
+
 /*
  *	lazy_scan_prune() -- lazy_scan_heap() pruning and freezing.
  *
@@ -2046,9 +2058,13 @@ lazy_scan_prune(LVRelState *vacrel,
 	vacrel->live_tuples += presult.live_tuples;
 	vacrel->recently_dead_tuples += presult.recently_dead_tuples;
 
-	/* Can't truncate this page */
 	if (presult.hastup)
+		/* Can't truncate this page, as it is not empty */
 		vacrel->nonempty_pages = blkno + 1;
+	else if (vacrel->try_decommit_empty_pages)
+		/* Attempt to decommit this page, as it is now empty */
+		try_decommit_page(vacrel, blkno);
+
 
 	/* Did we find LP_DEAD items? */
 	*has_lpdead_items = (presult.lpdead_items > 0);
