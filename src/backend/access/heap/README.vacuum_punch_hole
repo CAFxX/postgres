@@ -1,0 +1,322 @@
+VACUUM filesystem hole punching
+==============================
+
+Lazy VACUUM can deallocate the filesystem blocks backing completely
+empty heap pages ("hole punching"), reclaiming disk space without
+changing the logical size of the relation.  The feature is opt-in via
+the vacuum_punch_hole GUC (boolean, default off, PGC_USERSET, so it can
+be set per-session and applies to autovacuum workers as well).  Like
+vacuum_truncate, it follows the triple interface: GUC (global default),
+reloption vacuum_punch_hole (per-table, ternary), and VACUUM (PUNCH_HOLE
+...) option (per-command).  Resolution: explicit option > reloption >
+GUC > off.  When disabled, the punch path exits immediately with no
+bookkeeping overhead.
+
+A second knob, vacuum_punch_hole_min_size (integer kB, default 0=auto),
+sets the minimum hole size: ranges smaller than this are not punched.
+Unlike vacuum_punch_hole, this is GUC-only (no reloption or VACUUM option):
+per-segment fstatvfs() auto-detection already handles tablespace
+heterogeneity, and no credible per-table/per-command use case exists.  The
+auto default computes per segment via fstatvfs(): max(BLCKSZ, filesystem
+block size).  This handles tablespaces on different filesystems correctly,
+and avoids useless syscalls on filesystems with large allocation units.
+
+This complements vacuum_truncate rather than replacing it: truncation
+only reclaims empty pages at the tail of the relation and requires an
+AccessExclusive lock, while punching reclaims empty pages anywhere in
+the relation and needs no lock beyond what VACUUM already holds.  All
+deallocation is best-effort: on platforms or filesystems without hole
+punching support it silently does nothing.
+
+
+Lifecycle of a punched page
+---------------------------
+
+Candidate selection happens in lazy_scan_new_or_empty(), during the
+heap scan.  A page qualifies when it is PageIsNew() (all zeroes) or, with
+the GUC on, PageIsLogicallyEmpty(): it has no live line pointers.
+"Logically empty" is broader than PageIsEmpty(): a page whose tuples
+were all pruned away still carries its (now unused) line pointer array.
+
+Only LP_UNUSED line pointers count as empty.  LP_DEAD items block
+punching even though they hold no live data: index entries may still
+reference those TIDs until VACUUM's index cleanup deletes them, which
+happens after the heap scan that selects punch candidates.  Punching
+such a page would let the file range read back as zeroes (a new page)
+if the buffer were evicted, losing the LP_DEAD markers that tell index
+scans to skip those TIDs; a concurrently inserted tuple could then
+reuse the same offsets while stale index TIDs still point at them.
+
+Each candidate must also pass lazy_punch_page_safe():
+
+* the page is not marked all-visible (see "Visibility map" below), and
+* the page's LSN predates the redo pointer of the last completed
+  checkpoint (see "WAL and crash recovery" below).
+
+Pages failing the gate fall back to the stock behavior of being marked
+all-visible/all-frozen, so future vacuums can still skip them.
+
+Candidates arrive in ascending block order, so they are accumulated
+into contiguous runs (at most PUNCH_BATCH_MAX_BLOCKS = 128 blocks per
+batch, keeping re-verified pages hot under VACUUM's 256-page buffer
+access strategy ring).  A run is flushed when it breaks and once more
+after the heap scan, before lazy_truncate_heap() (which may remove
+trailing pages outright).
+
+The flush cannot punch immediately: the scan's lock on the page is
+released on return, and a page seen as empty might gain tuples before
+the flush (it was just advertised in the FSM as free space).  The flush
+therefore re-verifies every page under a freshly acquired exclusive
+buffer lock, then punches each maximal contiguous range of still-empty
+pages with one mdpunchhole() call per relation segment.
+
+After punching, each page's cached buffer image is zeroed with MemSet()
+but deliberately NOT marked dirty: the on-disk image is already zeroes
+where the punch worked, or still the old empty page where the
+filesystem doesn't support punching -- both read as an empty page.  This
+keeps the cache coherent with the disk and makes the buffers PageIsNew,
+so the next insert into the page takes the XLOG_HEAP_INIT_PAGE path
+(see "WAL and crash recovery").
+
+ReadBufferExtended() and mdpunchhole() can raise ERROR (I/O errors,
+failure to open a segment) while buffer content locks are held, which
+abort processing would otherwise leak.  The flush wraps its work in
+PG_TRY: buffers are zeroed even on the error path, so no page is ever
+left punched on disk but non-zero in cache, and every held lock and pin
+is released before rethrowing.
+
+
+Locking
+-------
+
+No relation-level lock beyond what VACUUM already holds: the file size
+never changes and only provably-empty pages are touched.
+
+Per page, the flush takes an exclusive buffer content lock and holds it
+across the punch.  The page is re-verified empty under that lock, so no
+concurrent backend can insert into it in the meantime (any inserter
+needs the same lock).  Locks are acquired conditionally and strictly in
+ascending block order, so the flush never blocks and cannot deadlock;
+pages that can't be locked, that gained content since the scan, or that
+no longer pass the safety gate are simply left for a future vacuum.
+
+Pages emptied by this vacuum's own pruning are deliberately NOT
+punched: the second heap pass dirties them and bumps their LSN, so
+punching would be both useless (a later writeback would reallocate the
+blocks) and unsafe (recovery could replay WAL onto the punched page).
+They become punchable via the empty-page path in a later vacuum, once a
+checkpoint has passed.  They are also not marked all-visible, so that
+later vacuum will actually visit them.
+
+
+WAL and crash recovery
+----------------------
+
+Punching is a filesystem metadata operation and is not WAL-logged.
+Crash safety rests on two properties instead:
+
+1. The LSN gate.  A page is only punched when its LSN predates the redo
+   pointer of the last completed checkpoint.  Every WAL record for the
+   page is then older than the point crash recovery would start from,
+   so none of them can ever be replayed onto the punched (all-zero)
+   page.  The redo pointer is read from pg_control under ControlFileLock
+   -- GetRedoRecPtr() is not suitable, as it returns the redo pointer
+   published when the current checkpoint started, and a page changed
+   between the two could be punched and then have that record replayed
+   if the checkpoint never completes.  The pointer is read once per
+   VACUUM and cached; a checkpoint completing afterwards only moves the
+   true redo pointer forward, so the cached value stays conservative.
+   If pg_control can't be read, punching is skipped (best effort).
+
+2. Page re-initialization on reuse.  After the punch the buffer is clean
+   zeroes, i.e. PageIsNew.  The next insert therefore emits
+   XLOG_HEAP_INIT_PAGE, a full page image.  Crash recovery can always
+   re-initialize a punched page -- even with full_page_writes=off,
+   because every WAL record written before the punch predates the last
+   completed checkpoint and is never replayed, while the first record
+   written after the punch carries a page-init.  If the buffer is
+   evicted before reuse, the page reads back as zeroes from disk, which
+   every code path already handles as a new page (PageInit on first
+   use).
+
+Unlogged and temporary relations use the same LSN gate.  This is
+conservative -- they are truncated on crash recovery, so punching their
+empty pages would be safe regardless of LSN -- but the uniform check is
+simpler and never wrong.
+
+The crash-safety argument is exercised by
+src/test/modules/test_misc/t/018_vacuum_punch_hole_crash.pl: punch,
+insert into punched space, kill -9 before the next checkpoint, verify
+data integrity after restart with full_page_writes both on and off.
+
+
+Visibility map
+--------------
+
+Punched pages are deliberately NOT marked all-visible before punching.
+The punch zeroes the page header, dropping its PD_ALL_VISIBLE flag,
+while the visibility map would still claim all-visible.  heap_insert()
+clears the visibility map only when the page header has PD_ALL_VISIBLE
+set, so a stale VM bit would survive reuse of the page and corrupt
+index-only scans.  Pages that are already all-visible are left alone
+(punching them would require clearing the VM first); they are rare,
+because vacuums using this code punch empty pages instead of marking
+them all-visible.  A side effect is that punched pages are revisited by
+future vacuums rather than skipped via the VM -- which is required
+anyway for a promoted standby to discover the free space (see
+"Replication").
+
+
+Buffer manager and checkpointer
+-------------------------------
+
+Zeroing the buffers without dirtying them keeps the cache coherent:
+both possible on-disk states (zeroes where the punch worked, the old
+empty page where the filesystem lacks support) read as an empty page.
+Clean buffers are never written by the checkpointer, so there is
+nothing to fsync and no checkpoint interaction.  Cost-based vacuum
+delay (vacuum_delay_point) is applied before the punch I/O.
+
+The flush acquires up to 128 buffer locks in exclusive mode (one per
+page in the batch) and holds them across the filesystem syscall.  This
+is correctness-critical: the re-verification under lock is what prevents
+a concurrent backend from inserting into a page after we've decided to
+punch it.  The downside is that a checkpointer (or any other backend)
+trying to acquire one of those buffers will stall until the batch
+completes.  In practice the syscall is fast (a single fallocate per
+segment), so stalls are brief, but they are possible.
+
+Replication
+-----------
+
+Physical replication ships WAL, not filesystem blocks, and punching is
+not WAL-logged.  Standbys therefore keep the blocks allocated: data is
+identical, only physical space usage diverges.  This is safe because the
+file size is unchanged (all platform calls use KEEP_SIZE semantics), so
+relation size metadata stays consistent, and because a punched page is
+indistinguishable from a new page, which the standby's replay already
+handles.  On promotion the standby works normally.  Base backups copy
+the files as-is; hole ranges are either preserved as sparse or expanded
+by the copy method, both correct.  Logical replication is unaffected
+(row changes only).
+
+
+Interaction with other subsystems
+---------------------------------
+
+* FSM: punched pages are recorded with their free space as usual, so
+  they are reused normally; a later write transparently reallocates the
+  filesystem blocks.
+* Index cleanup ordering: the punch flush runs after lazy_scan_heap()
+  (which includes index vacuum/cleanup and the second heap pass that
+  converts LP_DEAD to LP_UNUSED) and before lazy_truncate_heap().  A
+  page that was LP_DEAD-only during the scan is not a candidate this
+  pass; after the second pass makes it LP_UNUSED-only, a later
+  post-checkpoint vacuum can punch it.
+* pg_visibility / pageinspect: a punched page reads as a new (empty)
+  page, as expected.
+* Parallel VACUUM: candidate selection and the punch flush run in the
+  leader's heap-scan phase; index workers are unaffected.
+* VACUUM VERBOSE reports the number of pages whose filesystem blocks
+  were deallocated.
+
+
+smgr layer: mdpunchhole()
+-------------------------
+
+mdpunchhole() (src/backend/storage/smgr/md.c) deallocates the storage
+for a range of blocks known to read back as zeroes, without changing
+the file size; a later write transparently reallocates.  The range may
+span relation segments and is split so each segment gets a single call
+-- one syscall per segment instead of one per block.  It never creates
+missing segment files, retries on EINTR, and uses the segment's raw fd
+(via FileGetRawDesc()) since the segment is already open.
+
+Platform backends (selected by feature macros, so a platform gaining an
+API is picked up automatically):
+
+* Linux: fallocate(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE)
+* macOS: fcntl(F_PUNCHHOLE)
+* FreeBSD 14+: fspacectl(SPACECTL_DEALLOC).  Note: on filesystems without
+  a native deallocate implementation (e.g. UFS, which uses the default
+  vop_stddeallocate), the "punch" performs real zero-fill writes -- wasted
+  I/O, the opposite of the feature's goal -- yet success is still counted
+  in punched_blocks.  The range reads back as zeroes either way, so this
+  is only a reporting inaccuracy, but VERBOSE output should not be read
+  as "space reclaimed" on such filesystems.
+* Solaris/illumos: fcntl(F_FREESP) (true hole punch on ZFS; UFS/tmpfs
+  only implement the truncate form and return EINVAL, handled below)
+* Others (NetBSD, OpenBSD, DragonFly, Windows): silent no-op
+
+This is strictly best-effort and never raises: EOPNOTSUPP and ENOSYS
+mark the segment remembered as unsupported (mdfd_punchhole_unsupported),
+so an unsupported filesystem costs one failed syscall per segment file.
+EINVAL is treated as unsupported only on macOS and Solaris/illumos (where
+the platform documentation describes it as a legitimate rejection, not a
+bug); on Linux and FreeBSD, EINVAL indicates a bug in our range
+construction and is logged at LOG.  Any other unexpected errno is also
+logged at LOG.  The caller must guarantee every block in the range is
+empty and cannot concurrently gain content.
+
+Known external risk: this relies on the kernel implementing hole
+punching correctly for the given range.  A 2026 Linux series fixing data
+loss in truncate_inode_partial_folio() -- the generic page-cache path
+shared by hole punching -- was still unmerged at the time of writing;
+that is a kernel bug affecting all FALLOC_FL_PUNCH_HOLE users, not
+something this code can work around.
+
+
+When it helps (and when it doesn't)
+------------------------------------
+
+Punching deallocates whole filesystem blocks, so it only reclaims space
+when the storage stack's allocation unit is no larger than the database
+page size (block_size, normally 8 kB): if the filesystem block size or
+the disk sector size is larger than a database page, punching a page's
+range frees nothing.  On SSDs the same holds for the device's delete
+(deallocate) granularity, and the freed blocks only reach the device if
+the filesystem issues discards for them.  On such storage, enabling
+vacuum_punch_hole gains nothing while still costing a syscall per
+relation segment.
+
+It helps workloads that leave many fully-empty interior pages which
+truncation cannot reach -- e.g. bulk deletes scattered through a table
+-- on filesystems with working hole punching (ext4, XFS, btrfs, APFS,
+ZFS, tmpfs where supported).  pg_relation_size() is unchanged by
+punching (it reports the logical file size); physical usage is visible
+via the file's st_blocks, which t/016_vacuum_punch_hole.pl checks.
+
+
+Tests
+-----
+
+* t/016_vacuum_punch_hole.pl -- integration: st_blocks decreases while
+  the logical relation size is unchanged; the GUC defaults to off;
+  nothing is punched when disabled; VACUUM VERBOSE reports the punched
+  page count.  Skips on platforms/filesystems without punch support
+  (probed with a small C helper).
+* t/017_vacuum_punch_hole_mock.pl -- syscall marshalling with mock
+  implementations for the Linux, macOS, FreeBSD and Solaris branches:
+  correct argument passing, EINTR retry, hard-error propagation.
+* t/018_vacuum_punch_hole_crash.pl -- crash/recovery: punch, insert
+  into punched space, kill -9 before the next checkpoint, verify data
+  integrity after restart with full_page_writes on and off.
+* t/019_vacuum_punch_hole_segment.pl -- unit test for the segment-boundary
+  splitting in md_foreach_punch_segment(): extracts the real function from
+  md.c and verifies the per-segment (segment, byte offset, byte length)
+  tuples exactly tile the input range, with small, odd, and real
+  RELSEG_SIZE values.  A >1 GiB end-to-end test is impractical, so the
+  splitting arithmetic -- where a wrong byte range would corrupt data --
+  is covered deterministically here instead.
+
+
+Limitations
+-----------
+
+* Only completely empty, non-all-visible pages whose LSN predates the
+  last completed checkpoint are punched; anything else keeps the stock
+  behavior.
+* Reclaimed space is filesystem blocks only; the logical relation size
+  never shrinks (unlike truncation).
+* Best-effort by design: unsupported platforms/filesystems silently do
+  nothing, and skipped pages are simply left for a future vacuum.
