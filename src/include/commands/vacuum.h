@@ -24,6 +24,7 @@
 #include "parser/parse_node.h"
 #include "storage/buf.h"
 #include "utils/relcache.h"
+#include "utils/guc.h"
 
 /*
  * Flags for amparallelvacuumoptions to control the participation of bulkdelete
@@ -233,6 +234,7 @@ typedef struct VacuumParams
 											 * default */
 	VacOptValue index_cleanup;	/* Do index vacuum and cleanup */
 	VacOptValue truncate;		/* Truncate empty pages at the end */
+	VacOptValue punch_hole;		/* Punch holes in fully-empty pages */
 	Oid			toast_parent;	/* for privilege checks when recursing */
 
 	/*
@@ -339,6 +341,9 @@ extern PGDLLIMPORT int vacuum_failsafe_age;
 extern PGDLLIMPORT int vacuum_multixact_failsafe_age;
 extern PGDLLIMPORT bool track_cost_delay_timing;
 extern PGDLLIMPORT bool vacuum_truncate;
+extern PGDLLIMPORT bool vacuum_punch_hole;
+extern PGDLLIMPORT int vacuum_punch_hole_min_size;
+extern bool check_vacuum_punch_hole_min_size(int *newval, void **extra, GucSource source);
 
 /*
  * Relevant for vacuums implementing eager scanning. Normal vacuums may
@@ -432,6 +437,7 @@ extern void parallel_vacuum_cleanup_all_indexes(ParallelVacuumState *pvs,
 												PVWorkerStats *wstats);
 extern void parallel_vacuum_update_shared_delay_params(void);
 extern void parallel_vacuum_propagate_shared_delay_params(void);
+extern void parallel_vacuum_refresh_cost_params(void);
 extern void parallel_vacuum_main(dsm_segment *seg, shm_toc *toc);
 
 /* in commands/analyze.c */
