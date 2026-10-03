@@ -50,6 +50,10 @@ extern void mdwriteback(SMgrRelation reln, ForkNumber forknum,
 extern BlockNumber mdnblocks(SMgrRelation reln, ForkNumber forknum);
 extern void mdtruncate(SMgrRelation reln, ForkNumber forknum,
 					   BlockNumber curnblk, BlockNumber nblocks);
+extern void mdpunchhole(SMgrRelation reln, ForkNumber forknum,
+						BlockNumber blocknum, BlockNumber nblocks,
+						int64 min_hole_bytes,
+						MDPunchResult *result);
 extern void mdimmedsync(SMgrRelation reln, ForkNumber forknum);
 extern void mdregistersync(SMgrRelation reln, ForkNumber forknum);
 extern int	mdfd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off);
