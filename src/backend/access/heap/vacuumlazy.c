@@ -136,10 +136,12 @@
 #include "access/tidstore.h"
 #include "access/transam.h"
 #include "access/visibilitymap.h"
+#include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "catalog/storage.h"
 #include "commands/progress.h"
 #include "commands/vacuum.h"
+#include "common/controldata_utils.h"
 #include "common/int.h"
 #include "common/pg_prng.h"
 #include "executor/instrument.h"
@@ -151,7 +153,9 @@
 #include "storage/freespace.h"
 #include "storage/latch.h"
 #include "storage/lmgr.h"
+#include "storage/lwlock.h"
 #include "storage/read_stream.h"
+#include "storage/smgr.h"
 #include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/pg_rusage.h"
@@ -271,6 +275,9 @@ typedef struct LVRelState
 	bool		do_index_vacuuming;
 	bool		do_index_cleanup;
 	bool		do_rel_truncate;
+	/* Punch holes in fully-empty pages?  Minimum hole size in kB (0=auto). */
+	bool		do_punch_hole;
+	int			punch_hole_min_size;	/* snapshot of vacuum_punch_hole_min_size GUC */
 
 	/* VACUUM operation's cutoffs for freezing and pruning */
 	struct VacuumCutoffs cutoffs;
@@ -333,6 +340,42 @@ typedef struct LVRelState
 	BlockNumber lpdead_item_pages;	/* # pages with LP_DEAD items */
 	BlockNumber missed_dead_pages;	/* # pages with missed dead tuples */
 	BlockNumber nonempty_pages; /* actually, last nonempty page + 1 */
+
+	/*
+	 * Pending hole-punch batch: a run of consecutive heap blocks found to be
+	 * completely empty by lazy_scan_heap().  Their filesystem blocks are
+	 * deallocated in bulk by lazy_flush_punch_blocks(), which re-verifies
+	 * each page under lock before punching.  punch_nblocks is 0 when no run
+	 * is pending.
+	 */
+	BlockNumber punch_first_block;
+	BlockNumber punch_nblocks;
+
+	/*
+	 * Redo pointer of the last completed checkpoint, used as the LSN safety
+	 * gate for hole punching (see lazy_get_punch_redo_ptr()).  Read once in
+	 * heap_vacuum_rel -- so the per-page punch path never does file I/O
+	 * while holding buffer content locks -- and cached for the whole VACUUM.
+	 * Invalid if pg_control could not be read, in which case punching is
+	 * disabled.
+	 */
+	XLogRecPtr	punch_redo_ptr;
+
+	/*
+	 * # PG blocks whose filesystem blocks were deallocated by hole
+	 * punching.  This counts post-alignment blocks, which can differ from
+	 * the number of verified pages when filesystem-block alignment trims
+	 * the range edges.
+	 */
+	BlockNumber punch_blocks;
+	/* # PG blocks where the hole-punch syscall failed (best effort) */
+	BlockNumber punch_failed_blocks;
+
+	/*
+	 * Set when hole punching is found to be unsupported (filesystem or
+	 * platform); skips further punch work for the rest of this VACUUM.
+	 */
+	bool		punch_unsupported;
 
 	/* Statistics output by us, for table */
 	double		new_rel_tuples; /* new estimated total # of tuples */
@@ -433,6 +476,42 @@ static void find_next_unskippable_block(LVRelState *vacrel, bool *skipsallvis);
 static bool lazy_scan_new_or_empty(LVRelState *vacrel, Buffer buf,
 								   BlockNumber blkno, Page page,
 								   bool sharelock, Buffer vmbuffer);
+static void lazy_accumulate_punch_block(LVRelState *vacrel, BlockNumber blkno);
+static void lazy_flush_punch_blocks(LVRelState *vacrel);
+static XLogRecPtr lazy_get_punch_redo_ptr(void);
+static bool lazy_punch_page_safe(LVRelState *vacrel, Page page);
+/*
+ * page_is_logically_empty -- true iff the page has no live line pointers.
+ *
+ * This is broader than PageIsEmpty(): a page whose tuples were all pruned
+ * away still has its (now unused) line pointer array, so PageIsEmpty() is
+ * false, but the page is logically empty and safe to punch.
+ *
+ * Only LP_UNUSED line pointers count as empty.  LP_DEAD items must block
+ * punching even though they contain no live data: they may still be
+ * referenced by index entries until VACUUM's index cleanup deletes those
+ * TIDs (which happens after the heap scan that selects punch candidates).
+ * Punching such a page would let the file range read back as zeroes -- a
+ * new page -- if the buffer were evicted, losing the LP_DEAD markers that
+ * tell index scans to skip those TIDs.  A concurrently inserted tuple could
+ * then reuse the same offsets while stale index TIDs still point at them,
+ * making the stale TIDs resolve to an unrelated row.
+ */
+static inline bool
+page_is_logically_empty(Page page)
+{
+	OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+
+	for (OffsetNumber off = 1; off <= maxoff; off++)
+	{
+		ItemId		itemid = PageGetItemId(page, off);
+
+		if (ItemIdIsUsed(itemid))
+			return false;
+	}
+	return true;
+}
+
 static int	lazy_scan_prune(LVRelState *vacrel, Buffer buf,
 							BlockNumber blkno, Page page,
 							Buffer vmbuffer,
@@ -720,6 +799,8 @@ heap_vacuum_rel(Relation rel, const VacuumParams *params,
 	Assert(params->index_cleanup != VACOPTVALUE_UNSPECIFIED);
 	Assert(params->truncate != VACOPTVALUE_UNSPECIFIED &&
 		   params->truncate != VACOPTVALUE_AUTO);
+	Assert(params->punch_hole != VACOPTVALUE_UNSPECIFIED &&
+		   params->punch_hole != VACOPTVALUE_AUTO);
 
 	/*
 	 * While VacuumFailSafeActive is reset to false before calling this, we
@@ -730,6 +811,21 @@ heap_vacuum_rel(Relation rel, const VacuumParams *params,
 	vacrel->do_index_vacuuming = true;
 	vacrel->do_index_cleanup = true;
 	vacrel->do_rel_truncate = (params->truncate != VACOPTVALUE_DISABLED);
+	vacrel->do_punch_hole = (params->punch_hole != VACOPTVALUE_DISABLED);
+	/* GUC-only knob: snapshot once so the value can't change mid-VACUUM. */
+	vacrel->punch_hole_min_size = vacuum_punch_hole_min_size;
+	if (vacrel->do_punch_hole)
+	{
+		/*
+		 * Read the redo pointer of the last completed checkpoint up front,
+		 * so the per-page punch path never does file I/O (get_controlfile
+		 * under ControlFileLock) while holding buffer content locks.  The
+		 * cached value stays conservative for the whole VACUUM: redo only
+		 * moves forward, so a checkpoint completing later can only raise
+		 * the true redo pointer.  An invalid result disables punching.
+		 */
+		vacrel->punch_redo_ptr = lazy_get_punch_redo_ptr();
+	}
 	if (params->index_cleanup == VACOPTVALUE_DISABLED)
 	{
 		/* Force disable index vacuuming up-front */
@@ -878,6 +974,14 @@ heap_vacuum_rel(Relation rel, const VacuumParams *params,
 	 * vacuuming, and heap vacuuming (plus related processing)
 	 */
 	lazy_scan_heap(vacrel);
+
+	/*
+	 * Deallocate the filesystem blocks of the final pending run of empty
+	 * heap pages found by the scan.  (Runs broken mid-scan were already
+	 * flushed by lazy_accumulate_punch_block().)  This must happen before
+	 * lazy_truncate_heap(), which may remove trailing pages outright.
+	 */
+	lazy_flush_punch_blocks(vacrel);
 
 	/*
 	 * Save dead items max_bytes and update the memory usage statistics before
@@ -1068,6 +1172,10 @@ heap_vacuum_rel(Relation rel, const VacuumParams *params,
 							 100.0 * vacrel->scanned_pages /
 							 orig_rel_pages,
 							 vacrel->eager_scanned_pages);
+			if (vacrel->punch_blocks > 0 || vacrel->punch_failed_blocks > 0)
+				appendStringInfo(&buf, _("hole punching: %u blocks deallocated, %u blocks failed\n"),
+								 vacrel->punch_blocks,
+								 vacrel->punch_failed_blocks);
 			appendStringInfo(&buf,
 							 _("tuples: %" PRId64 " removed, %" PRId64 " remain, %" PRId64 " are dead but not yet removable\n"),
 							 vacrel->tuples_deleted,
@@ -1437,8 +1545,8 @@ lazy_scan_heap(LVRelState *vacrel)
 			LockBuffer(buf, BUFFER_LOCK_SHARE);
 
 		/* Check for new or empty pages before lazy_scan_[no]prune call */
-		if (lazy_scan_new_or_empty(vacrel, buf, blkno, page, !got_cleanup_lock,
-								   vmbuffer))
+		if (lazy_scan_new_or_empty(vacrel, buf, blkno, page,
+								   !got_cleanup_lock, vmbuffer))
 		{
 			/* Processed as new/empty page (lock and pin released) */
 			continue;
@@ -1853,6 +1961,71 @@ find_next_unskippable_block(LVRelState *vacrel, bool *skipsallvis)
 }
 
 /*
+ * lazy_mark_empty_page_all_visible() -- mark an empty heap page all-visible
+ * and all-frozen in the visibility map.
+ *
+ * This is the stock treatment for empty pages found by lazy VACUUM.  It is
+ * used both when hole punching is disabled and, when punching is enabled,
+ * for empty pages that cannot be punched (e.g. their LSN is too new): such
+ * pages should still get the stock visibility-map marking so future vacuums
+ * can skip them.
+ *
+ * Caller must hold an exclusive lock on buf.
+ */
+static void
+lazy_mark_empty_page_all_visible(LVRelState *vacrel, Buffer buf,
+								 BlockNumber blkno, Page page, Buffer vmbuffer)
+{
+	/*
+	 * Unlike new pages, empty pages are always set all-visible and
+	 * all-frozen.
+	 */
+	if (!PageIsAllVisible(page))
+	{
+		/* Lock vmbuffer before entering critical section */
+		LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+
+		START_CRIT_SECTION();
+
+		/* mark buffer dirty before writing a WAL record */
+		MarkBufferDirty(buf);
+
+		PageSetAllVisible(page);
+		PageClearPrunable(page);
+		(void) visibilitymap_set(blkno,
+									 vmbuffer,
+									 VISIBILITYMAP_ALL_VISIBLE |
+									 VISIBILITYMAP_ALL_FROZEN,
+									 vacrel->rel->rd_locator);
+
+		/*
+		 * Emit WAL for setting PD_ALL_VISIBLE on the heap page and
+		 * setting the VM.
+		 */
+		if (RelationNeedsWAL(vacrel->rel))
+			log_heap_prune_and_freeze(vacrel->rel, buf,
+										  vmbuffer,
+										  VISIBILITYMAP_ALL_VISIBLE |
+										  VISIBILITYMAP_ALL_FROZEN,
+										  InvalidTransactionId, /* conflict xid */
+										  false,	/* cleanup lock */
+										  PRUNE_VACUUM_SCAN,	/* reason */
+										  NULL, 0,
+										  NULL, 0,
+										  NULL, 0,
+										  NULL, 0);
+
+		END_CRIT_SECTION();
+
+		LockBuffer(vmbuffer, BUFFER_LOCK_UNLOCK);
+
+		/* Count the newly all-frozen pages for logging */
+		vacrel->new_all_visible_pages++;
+		vacrel->new_all_visible_all_frozen_pages++;
+	}
+}
+
+/*
  *	lazy_scan_new_or_empty() -- lazy_scan_heap() new/empty page handling.
  *
  * Must call here to handle both new and empty pages before calling
@@ -1882,15 +2055,16 @@ find_next_unskippable_block(LVRelState *vacrel, bool *skipsallvis)
  *
  * No vm_page_frozen output parameter (like that passed to lazy_scan_prune())
  * is passed here because neither empty nor new pages can be eagerly frozen.
- * New pages are never frozen. Empty pages are always set frozen in the VM at
- * the same time that they are set all-visible, and we don't eagerly scan
- * frozen pages.
+ * New pages are never frozen.  We deliberately do not set empty pages
+ * all-visible in the visibility map (see below), so there is nothing to
+ * freeze here either.
  */
 static bool
 lazy_scan_new_or_empty(LVRelState *vacrel, Buffer buf, BlockNumber blkno,
 					   Page page, bool sharelock, Buffer vmbuffer)
 {
 	Size		freespace;
+	bool		accumulate_punch = false;
 
 	if (PageIsNew(page))
 	{
@@ -1912,8 +2086,17 @@ lazy_scan_new_or_empty(LVRelState *vacrel, Buffer buf, BlockNumber blkno,
 		 * Do that by testing if there's any space recorded for the page. If
 		 * not, enter it. We do so after releasing the lock on the heap page,
 		 * the FSM is approximate, after all.
+		 *
+		 * The page is all zeroes, so record it for batched hole punching:
+		 * its filesystem blocks will be deallocated once we know whether
+		 * neighboring pages are empty too, letting a single call cover the
+		 * whole run.  This happens after the lock is released: accumulating
+		 * may flush the pending batch, and the flush's delay/interrupt
+		 * checks must not run while holding the scan page's lock.
 		 */
 		UnlockReleaseBuffer(buf);
+
+		lazy_accumulate_punch_block(vacrel, blkno);
 
 		if (GetRecordedFreeSpace(vacrel->rel, blkno) == 0)
 		{
@@ -1925,7 +2108,7 @@ lazy_scan_new_or_empty(LVRelState *vacrel, Buffer buf, BlockNumber blkno,
 		return true;
 	}
 
-	if (PageIsEmpty(page))
+	if (PageIsEmpty(page) || (vacrel->do_punch_hole && page_is_logically_empty(page)))
 	{
 		/*
 		 * It seems likely that caller will always be able to get a cleanup
@@ -1937,7 +2120,8 @@ lazy_scan_new_or_empty(LVRelState *vacrel, Buffer buf, BlockNumber blkno,
 			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 
-			if (!PageIsEmpty(page))
+			if (!PageIsEmpty(page) &&
+				!(vacrel->do_punch_hole && page_is_logically_empty(page)))
 			{
 				/* page isn't new or empty -- keep lock and pin for now */
 				return false;
@@ -1949,61 +2133,399 @@ lazy_scan_new_or_empty(LVRelState *vacrel, Buffer buf, BlockNumber blkno,
 		}
 
 		/*
-		 * Unlike new pages, empty pages are always set all-visible and
-		 * all-frozen.
+		 * Whether this page is a punch candidate is decided under the lock
+		 * (see lazy_punch_page_safe()); the actual accumulation is deferred
+		 * until after the lock is released, since it may flush the pending
+		 * batch and the flush's delay/interrupt checks must not run while
+		 * holding the scan page's lock.
 		 */
-		if (!PageIsAllVisible(page))
+		if (!vacrel->do_punch_hole)
 		{
-			/* Lock vmbuffer before entering critical section */
-			LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
-
-			START_CRIT_SECTION();
-
-			/* mark buffer dirty before writing a WAL record */
-			MarkBufferDirty(buf);
-
-			PageSetAllVisible(page);
-			PageClearPrunable(page);
-			(void) visibilitymap_set(blkno,
-									 vmbuffer,
-									 VISIBILITYMAP_ALL_VISIBLE |
-									 VISIBILITYMAP_ALL_FROZEN,
-									 vacrel->rel->rd_locator);
-
 			/*
-			 * Emit WAL for setting PD_ALL_VISIBLE on the heap page and
-			 * setting the VM.
+			 * Hole punching is disabled: use the stock behavior for empty
+			 * pages, marking them all-visible and all-frozen.
 			 */
-			if (RelationNeedsWAL(vacrel->rel))
-				log_heap_prune_and_freeze(vacrel->rel, buf,
-										  vmbuffer,
-										  VISIBILITYMAP_ALL_VISIBLE |
-										  VISIBILITYMAP_ALL_FROZEN,
-										  InvalidTransactionId, /* conflict xid */
-										  false,	/* cleanup lock */
-										  PRUNE_VACUUM_SCAN,	/* reason */
-										  NULL, 0,
-										  NULL, 0,
-										  NULL, 0,
-										  NULL, 0);
-
-			END_CRIT_SECTION();
-
-			LockBuffer(vmbuffer, BUFFER_LOCK_UNLOCK);
-
-			/* Count the newly all-frozen pages for logging */
-			vacrel->new_all_visible_pages++;
-			vacrel->new_all_visible_all_frozen_pages++;
+			lazy_mark_empty_page_all_visible(vacrel, buf, blkno, page,
+									   vmbuffer);
+		}
+		else
+		{
+			/*
+			 * The page is completely empty.  If it is safe to do so, record it
+			 * for batched hole punching (see lazy_accumulate_punch_block()).
+			 * Deallocating its blocks is safe: the range reads back as zeroes,
+			 * i.e. as a new page, which every part of the system already knows
+			 * how to handle (the page is re-initialized when it is next used
+			 * for tuples).
+			 *
+			 * Punching is only safe when the page contains no LP_DEAD line
+			 * pointers, only LP_UNUSED (see page_is_logically_empty()): LP_DEAD
+			 * items may still be referenced by index entries, and losing their
+			 * markers to a punch would let stale index TIDs resolve to
+			 * unrelated tuples after the offsets are reused.  The remaining
+			 * safety conditions (not all-visible, LSN predating the last
+			 * completed checkpoint) are checked by lazy_punch_page_safe().
+			 */
+			if (lazy_punch_page_safe(vacrel, page))
+				accumulate_punch = true;
+			else if (PageIsAllVisible(page))
+			{
+				/*
+				 * Already all-visible: fall back to the stock all-visible
+				 * marking (a no-op for the page header, but updates the
+				 * visibility map) so future vacuums can still skip it.
+				 */
+				lazy_mark_empty_page_all_visible(vacrel, buf, blkno, page,
+											 vmbuffer);
+			}
+			/*
+			 * Else: the page is empty but its LSN is too new for safe
+			 * punching.  Do not mark it all-visible: that would permanently
+			 * disqualify it from hole punching (see lazy_punch_page_safe()),
+			 * while the LSN condition is transient -- a future VACUUM after a
+			 * checkpoint will find the LSN old enough and punch the page.
+			 */
 		}
 
 		freespace = PageGetHeapFreeSpace(page);
 		UnlockReleaseBuffer(buf);
+		if (accumulate_punch)
+			lazy_accumulate_punch_block(vacrel, blkno);
 		RecordPageWithFreeSpace(vacrel->rel, blkno, freespace);
 		return true;
 	}
 
 	/* page isn't new or empty -- keep lock and pin */
 	return false;
+}
+
+/*
+ * Maximum blocks per hole-punch batch.  Bounds the work done by each
+ * lazy_flush_punch_blocks() call and keeps the re-verified pages hot in
+ * shared buffers (VACUUM's buffer access strategy ring holds 256 pages).
+ */
+#define PUNCH_BATCH_MAX_BLOCKS 128
+
+/*
+ * lazy_get_punch_redo_ptr() -- redo pointer of the last completed checkpoint
+ *
+ * Hole punching is not WAL-logged, so crash recovery must never need to
+ * replay a WAL record onto a punched (all-zero) page.  A page is therefore
+ * only punched when its LSN predates the last completed checkpoint's redo
+ * pointer: every WAL record for the page is then older than the point
+ * recovery would start from, so none of them can be replayed after the
+ * punch.
+ *
+ * Note that GetRedoRecPtr() is not suitable here: it returns the redo
+ * pointer published when the current checkpoint started, while recovery
+ * restarts from the last completed checkpoint.  During a checkpoint, a page
+ * whose last WAL record falls between the two could be punched and then
+ * have that record replayed onto the zeroed page if the checkpoint never
+ * completes.  We therefore read pg_control under ControlFileLock, which the
+ * checkpointer holds exclusively while making a checkpoint durable.
+ *
+ * Returns InvalidXLogRecPtr if pg_control cannot be read; the caller must
+ * then skip punching (best effort).
+ */
+static XLogRecPtr
+lazy_get_punch_redo_ptr(void)
+{
+	ControlFileData *ControlFile = NULL;
+	bool		crc_ok = false;
+	XLogRecPtr	redo = InvalidXLogRecPtr;
+
+	PG_TRY();
+	{
+		LWLockAcquire(ControlFileLock, LW_SHARED);
+		ControlFile = get_controlfile(DataDir, &crc_ok);
+		if (crc_ok)
+			redo = ControlFile->checkPointCopy.redo;
+		LWLockRelease(ControlFileLock);
+	}
+	PG_CATCH();
+	{
+		/* Best effort: if pg_control can't be read, don't punch. */
+		if (LWLockHeldByMe(ControlFileLock))
+			LWLockRelease(ControlFileLock);
+		FlushErrorState();
+		ereport(DEBUG1,
+				(errmsg("could not read pg_control for hole-punch LSN gate; skipping hole punching")));
+	}
+	PG_END_TRY();
+
+	if (ControlFile)
+		pfree(ControlFile);
+
+	return redo;
+}
+
+/*
+ * lazy_punch_page_safe() -- is this empty page safe to punch right now?
+ *
+ * The page must not be marked all-visible, and its LSN must predate the last
+ * completed checkpoint's redo pointer (see lazy_get_punch_redo_ptr()).
+ *
+ * We deliberately do not set the page all-visible before punching: the punch
+ * turns the page into all zeroes, which drops the page header's
+ * PD_ALL_VISIBLE flag while the visibility map would still say all-visible.
+ * heap_insert() only clears the visibility map when the page header has
+ * PD_ALL_VISIBLE set, so a stale VM bit would survive reuse of the page and
+ * corrupt index-only scans.  (Pages that are already all-visible are left
+ * alone; they are rare -- vacuums using this code punch pages instead of
+ * marking them all-visible -- and punching them would require clearing the
+ * visibility map first.)
+ *
+ * The redo pointer is read once in heap_vacuum_rel and cached in vacrel.
+ * A checkpoint completing afterwards only moves the true redo pointer
+ * forward, so the cached value stays conservative for the rest of the
+ * VACUUM.
+ *
+ * Unlogged and temporary tables use the same LSN gate.  This is
+ * conservative: they are truncated on crash recovery, so punching their
+ * empty pages would be safe regardless of LSN, but the uniform check is
+ * simpler and never wrong.
+ */
+static bool
+lazy_punch_page_safe(LVRelState *vacrel, Page page)
+{
+	Assert(vacrel->do_punch_hole);
+
+	/* No redo pointer (pg_control was unreadable): don't punch. */
+	if (!XLogRecPtrIsValid(vacrel->punch_redo_ptr))
+		return false;
+
+	return !PageIsAllVisible(page) &&
+		PageGetLSN(page) < vacrel->punch_redo_ptr;
+}
+
+/*
+ * lazy_accumulate_punch_block() -- record a completely empty heap page for
+ *									batched hole punching
+ *
+ * lazy_scan_heap() visits heap pages in ascending block order, so empty pages
+ * usually arrive here as contiguous runs.  Instead of deallocating each
+ * page's filesystem blocks with its own syscall, we accumulate the run and
+ * let lazy_flush_punch_blocks() deallocate the whole run with one call per
+ * relation segment once the run ends.
+ *
+ * We cannot punch the blocks right away and keep the batching: the caller's
+ * lock on the page is released on return, and a page we saw as empty might
+ * gain tuples before we get around to punching it (it was just advertised in
+ * the FSM as free space).  The flush therefore re-verifies every page under
+ * a freshly acquired lock.
+ */
+static void
+lazy_accumulate_punch_block(LVRelState *vacrel, BlockNumber blkno)
+{
+	/* Hole punching is opt-in; skip the bookkeeping if disabled */
+	if (!vacrel->do_punch_hole)
+		return;
+
+	/* Filesystem doesn't support it; stop trying for this VACUUM */
+	if (vacrel->punch_unsupported)
+		return;
+
+	if (vacrel->punch_nblocks > 0 &&
+		blkno == vacrel->punch_first_block + vacrel->punch_nblocks &&
+		vacrel->punch_nblocks < PUNCH_BATCH_MAX_BLOCKS)
+	{
+		/* Contiguous with the pending run; extend it */
+		vacrel->punch_nblocks++;
+		return;
+	}
+
+	/* Run broken (or batch full, or none pending): flush and start a new run */
+	lazy_flush_punch_blocks(vacrel);
+	vacrel->punch_first_block = blkno;
+	vacrel->punch_nblocks = 1;
+}
+
+/*
+ * lazy_flush_punch_blocks() -- deallocate filesystem blocks for the pending
+ *								run of completely empty heap pages
+ *
+ * Re-verifies every page of the run under an exclusive lock, then punches
+ * each maximal contiguous range of still-empty pages with a single
+ * mdpunchhole() call.  Pages are visited in ascending block order and
+ * locks are taken conditionally, so we never block and cannot deadlock;
+ * pages that can't be locked, that have gained content since the scan saw
+ * them empty, or that are no longer safe to punch (see
+ * lazy_punch_page_safe()), are simply left for a future vacuum.
+ *
+ * Every punched page is locked for the duration of its punch, so none of
+ * them can concurrently gain content.  The pages were all visited moments
+ * ago by the scan, so re-verifying them will normally find them still in
+ * shared buffers.
+ *
+ * After punching, each page's cached image is zeroed (without dirtying the
+ * buffer: the on-disk image is already zeroes, or still the old empty page
+ * where punching isn't supported -- both read as an empty page).  This keeps
+ * the cache coherent with the disk and makes the buffers PageIsNew, so the
+ * next insert into the page takes the XLOG_HEAP_INIT_PAGE path.  Crash
+ * recovery can therefore always re-initialize a punched page, even with
+ * full_page_writes=off: WAL records written before the punch all predate
+ * the last completed checkpoint (see lazy_get_punch_redo_ptr()) and are
+ * never replayed, and the first record written after the punch carries a
+ * page-init.
+ *
+ * ReadBufferExtended() and mdpunchhole() can raise ERROR (I/O errors,
+ * failure to open a relation segment) while we hold buffer content locks,
+ * which abort processing would otherwise leak.  The PG_TRY block below
+ * releases every held lock and pin before rethrowing.  Buffers are zeroed
+ * even on the error path, so no page is ever left punched on disk but
+ * non-zero in cache.
+ */
+static void
+lazy_flush_punch_blocks(LVRelState *vacrel)
+{
+	BlockNumber first_block = vacrel->punch_first_block;
+	BlockNumber nblocks = vacrel->punch_nblocks;
+	/*
+	 * Elements are volatile: they are written inside PG_TRY and read in
+	 * PG_CATCH, so they must survive longjmp clobbering per PG's
+	 * error-handling convention.
+	 */
+	volatile Buffer *bufs;
+	volatile BlockNumber nlocked;
+	BlockNumber i;
+
+	if (nblocks == 0)
+		return;
+
+	/* Reset first, so the run can't be punched twice */
+	vacrel->punch_first_block = InvalidBlockNumber;
+	vacrel->punch_nblocks = 0;
+
+	/*
+	 * Cost-based delay for the upcoming I/O.  vacuum_delay_point() always
+	 * checks for interrupts first, so no separate CHECK_FOR_INTERRUPTS()
+	 * is needed here.  (This now runs after the scan page's lock is
+	 * released; see lazy_scan_new_or_empty().)
+	 */
+	vacuum_delay_point(false);
+
+	bufs = (volatile Buffer *) palloc_array(Buffer, nblocks);
+	nlocked = 0;
+
+	PG_TRY();
+	{
+		for (i = 0; i < nblocks; i++)
+		{
+			BlockNumber blkno = first_block + i;
+			Buffer		buf;
+			Page		page;
+
+			buf = ReadBufferExtended(vacrel->rel, MAIN_FORKNUM, blkno,
+									 RBM_NORMAL, vacrel->bstrategy);
+
+			if (!ConditionalLockBuffer(buf))
+			{
+				ReleaseBuffer(buf);
+				continue;
+			}
+
+			page = BufferGetPage(buf);
+			if ((!PageIsNew(page) && !page_is_logically_empty(page)) ||
+				!lazy_punch_page_safe(vacrel, page))
+			{
+				/*
+				 * No longer empty, became all-visible (index-only scans
+				 * could still read a stale visibility-map bit for it), or
+				 * its LSN is too new for safe punching (see
+				 * lazy_punch_page_safe()); leave it alone.
+				 */
+				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+				ReleaseBuffer(buf);
+				continue;
+			}
+
+			/* Keep the pin and lock across the punch below */
+			bufs[nlocked++] = buf;
+		}
+
+		/* Punch each maximal contiguous range of verified pages in one call */
+		i = 0;
+		while (i < nlocked)
+		{
+			BlockNumber range_start = BufferGetBlockNumber(bufs[i]);
+			BlockNumber j = i + 1;
+			MDPunchResult result;
+
+			while (j < nlocked &&
+				   BufferGetBlockNumber(bufs[j]) ==
+				   BufferGetBlockNumber(bufs[j - 1]) + 1)
+				j++;
+
+			CHECK_FOR_INTERRUPTS();
+
+			/*
+			 * Pass the minimum hole size (0 = auto), resolved from the
+			 * vacuum_punch_hole_min_size GUC.
+			 */
+			smgrpunchhole(RelationGetSmgr(vacrel->rel), MAIN_FORKNUM,
+						  range_start, j - i,
+						  (int64) vacrel->punch_hole_min_size * 1024,
+						  &result);
+
+			vacrel->punch_blocks += result.punched_blocks;
+			/* failed_blocks are counted but don't abort; see smgrpunchhole */
+			vacrel->punch_failed_blocks += result.failed_blocks;
+
+			if (result.unsupported)
+				vacrel->punch_unsupported = true;
+
+			i = j;
+		}
+
+		/*
+		 * Make the cached images match the disk: the punched ranges read
+		 * back as zeroes.  See the function header comment for why the
+		 * buffers are zeroed without being dirtied.  Buffers are zeroed
+		 * even if the punch didn't deallocate (unsupported FS, too-small
+		 * range): the page was verified empty, so zeroes are correct
+		 * either way.
+		 */
+		for (i = 0; i < nlocked; i++)
+		{
+			Buffer		buf = bufs[i];
+
+			MemSet(BufferGetPage(buf), 0, BLCKSZ);
+		}
+
+		for (i = 0; i < nlocked; i++)
+		{
+			Buffer		buf = bufs[i];
+
+			UnlockReleaseBuffer(buf);
+		}
+	}
+	PG_CATCH();
+	{
+		BlockNumber j;
+
+		/*
+		 * Zero the images even here (see above), then release every held
+		 * lock and pin before rethrowing: abort processing does not
+		 * release buffer content locks.
+		 */
+		for (j = 0; j < nlocked; j++)
+		{
+			Buffer		buf = bufs[j];
+
+			MemSet(BufferGetPage(buf), 0, BLCKSZ);
+		}
+		for (j = 0; j < nlocked; j++)
+		{
+			Buffer		buf = bufs[j];
+
+			UnlockReleaseBuffer(buf);
+		}
+		pfree((void *) bufs);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	pfree((void *) bufs);
 }
 
 /* qsort comparator for sorting OffsetNumbers */
@@ -2797,6 +3319,13 @@ lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno, Buffer buffer,
 	 * enabling both changes to be emitted in a single WAL record. Since the
 	 * visibility checks may perform I/O and allocate memory, they must be
 	 * done outside the critical section.
+	 *
+	 * However, if pruning will empty the page completely, we deliberately
+	 * do NOT mark it all-visible.  An empty page is a candidate for hole
+	 * punching by a later vacuum (see lazy_scan_new_or_empty()), but only
+	 * if the later vacuum actually visits it; marking it all-visible here
+	 * would let future vacuums skip it via the visibility map, so it would
+	 * never be punched.
 	 */
 	if (heap_page_would_be_all_visible(vacrel->rel, buffer,
 									   vacrel->vistest, true,
@@ -2804,19 +3333,72 @@ lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno, Buffer buffer,
 									   &all_frozen, &newest_live_xid,
 									   &vacrel->offnum))
 	{
-		vmflags |= VISIBILITYMAP_ALL_VISIBLE;
-		if (all_frozen)
+		/*
+		 * Check whether pruning will leave the page completely empty.  We
+		 * can't punch it right now (the buffer will be dirty with a new
+		 * LSN), but a later vacuum can, provided we don't mark it
+		 * all-visible.  Only worth computing when hole punching is
+		 * enabled; otherwise fall through to the stock behavior below
+		 * (mark all-visible).
+		 */
+		bool		will_be_empty = false;
+
+		if (vacrel->do_punch_hole)
 		{
-			vmflags |= VISIBILITYMAP_ALL_FROZEN;
-			Assert(!TransactionIdIsValid(newest_live_xid));
+			OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+
+			will_be_empty = true;
+
+			for (OffsetNumber off = 1; off <= maxoff; off++)
+			{
+				ItemId		itemid = PageGetItemId(page, off);
+				bool		will_be_unused = false;
+
+				if (!ItemIdIsUsed(itemid))
+					continue;
+
+				/*
+				 * Only LP_DEAD items listed in deadoffsets will become unused
+				 * below.  Any other used line pointer -- including an LP_DEAD
+				 * item that is not being converted -- means the page will not
+				 * be completely empty.
+				 */
+				if (ItemIdIsDead(itemid))
+				{
+					for (int i = 0; i < num_offsets; i++)
+					{
+						if (deadoffsets[i] == off)
+						{
+							will_be_unused = true;
+							break;
+						}
+					}
+				}
+
+				if (!will_be_unused)
+				{
+					will_be_empty = false;
+					break;
+				}
+			}
 		}
 
-		/*
-		 * Take the lock on the vmbuffer before entering a critical section.
-		 * The heap page lock must also be held while updating the VM to
-		 * ensure consistency.
-		 */
-		LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+		if (!will_be_empty)
+		{
+			vmflags |= VISIBILITYMAP_ALL_VISIBLE;
+			if (all_frozen)
+			{
+				vmflags |= VISIBILITYMAP_ALL_FROZEN;
+				Assert(!TransactionIdIsValid(newest_live_xid));
+			}
+
+			/*
+			 * Take the lock on the vmbuffer before entering a critical section.
+			 * The heap page lock must also be held while updating the VM to
+			 * ensure consistency.
+			 */
+			LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+		}
 	}
 
 	START_CRIT_SECTION();
@@ -2882,6 +3464,16 @@ lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno, Buffer buffer,
 		if (all_frozen)
 			vacrel->new_all_visible_all_frozen_pages++;
 	}
+
+	/*
+	 * Note: if pruning emptied the page completely, we deliberately do not
+	 * punch its filesystem blocks here.  The buffer is dirty and its LSN is
+	 * new, so punching would be both useless (a later write would
+	 * reallocate the blocks) and unsafe (crash recovery could replay WAL
+	 * onto the punched page).  The next vacuum will punch it via the
+	 * empty-page path in lazy_scan_new_or_empty(), once a checkpoint has
+	 * passed.
+	 */
 
 	/* Revert to the previous phase information for error traceback */
 	restore_vacuum_error_info(vacrel, &saved_err_info);
@@ -3038,16 +3630,26 @@ lazy_vacuum_one_index(Relation indrel, IndexBulkDeleteResult *istat,
 {
 	IndexVacuumInfo ivinfo;
 	LVSavedErrInfo saved_err_info;
+	const int	reset_index[] = {
+		PROGRESS_VACUUM_CURRENT_INDEX_RELID,
+		PROGRESS_SCAN_BLOCKS_TOTAL,
+		PROGRESS_SCAN_BLOCKS_DONE
+	};
+	const int64 reset_val[] = {(int64) InvalidOid, 0, 0};
 
 	ivinfo.index = indrel;
 	ivinfo.heaprel = vacrel->rel;
 	ivinfo.analyze_only = false;
 	ivinfo.is_autovacuum = AmAutoVacuumWorkerProcess();
-	ivinfo.report_progress = false;
+	ivinfo.report_progress = true;
 	ivinfo.estimated_count = true;
 	ivinfo.message_level = DEBUG2;
 	ivinfo.num_heap_tuples = reltuples;
 	ivinfo.strategy = vacrel->bstrategy;
+
+	/* Report which index we're currently processing */
+	pgstat_progress_update_param(PROGRESS_VACUUM_CURRENT_INDEX_RELID,
+								 (int64) RelationGetRelid(indrel));
 
 	/*
 	 * Update error traceback information.
@@ -3070,6 +3672,8 @@ lazy_vacuum_one_index(Relation indrel, IndexBulkDeleteResult *istat,
 	pfree(vacrel->indname);
 	vacrel->indname = NULL;
 
+	pgstat_progress_update_multi_param(3, reset_index, reset_val);
+
 	return istat;
 }
 
@@ -3089,17 +3693,27 @@ lazy_cleanup_one_index(Relation indrel, IndexBulkDeleteResult *istat,
 {
 	IndexVacuumInfo ivinfo;
 	LVSavedErrInfo saved_err_info;
+	const int	reset_index[] = {
+		PROGRESS_VACUUM_CURRENT_INDEX_RELID,
+		PROGRESS_SCAN_BLOCKS_TOTAL,
+		PROGRESS_SCAN_BLOCKS_DONE
+	};
+	const int64 reset_val[] = {(int64) InvalidOid, 0, 0};
 
 	ivinfo.index = indrel;
 	ivinfo.heaprel = vacrel->rel;
 	ivinfo.analyze_only = false;
 	ivinfo.is_autovacuum = AmAutoVacuumWorkerProcess();
-	ivinfo.report_progress = false;
+	ivinfo.report_progress = true;
 	ivinfo.estimated_count = estimated_count;
 	ivinfo.message_level = DEBUG2;
 
 	ivinfo.num_heap_tuples = reltuples;
 	ivinfo.strategy = vacrel->bstrategy;
+
+	/* Report which index we're currently processing */
+	pgstat_progress_update_param(PROGRESS_VACUUM_CURRENT_INDEX_RELID,
+								 (int64) RelationGetRelid(indrel));
 
 	/*
 	 * Update error traceback information.
@@ -3119,6 +3733,8 @@ lazy_cleanup_one_index(Relation indrel, IndexBulkDeleteResult *istat,
 	restore_vacuum_error_info(vacrel, &saved_err_info);
 	pfree(vacrel->indname);
 	vacrel->indname = NULL;
+
+	pgstat_progress_update_multi_param(3, reset_index, reset_val);
 
 	return istat;
 }
