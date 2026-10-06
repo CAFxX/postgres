@@ -435,6 +435,9 @@
 /* Define to 1 if you have the <sys/event.h> header file. */
 #undef HAVE_SYS_EVENT_H
 
+/* Define to 1 if you have the <sys/fspacectl.h> header file. */
+#undef HAVE_SYS_FSPACECTL_H
+
 /* Define to 1 if you have the <sys/personality.h> header file. */
 #undef HAVE_SYS_PERSONALITY_H
 
