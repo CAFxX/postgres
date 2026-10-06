@@ -10039,6 +10039,74 @@ COPY postgres_log FROM '/full/path/to/logfile.csv' WITH csv;
         </para>
        </listitem>
       </varlistentry>
+
+      <varlistentry id="guc-vacuum-punch-hole" xreflabel="vacuum_punch_hole">
+       <term><varname>vacuum_punch_hole</varname> (<type>boolean</type>)
+       <indexterm>
+        <primary><varname>vacuum_punch_hole</varname></primary>
+        <secondary>configuration parameter</secondary>
+       </indexterm>
+       </term>
+       <listitem>
+        <para>
+         Enables or disables <command>VACUUM</command> (including autovacuum)
+         deallocating the filesystem blocks backing fully-empty heap pages
+         (<quote>hole punching</quote>), instead of leaving them allocated.
+         The default value is <literal>false</literal>.  When enabled, the
+         logical size of the relation is unchanged; only the physical disk
+         usage is reduced.  Deallocation is best-effort: it is silently
+         skipped on platforms or filesystems without support, and only
+         applies to pages that are completely empty, not marked all-visible,
+         and whose last modification predates the last completed
+         checkpoint's redo point.  Unlike <varname>vacuum_truncate</varname>, no additional
+         lock is required.  This parameter can also be set per-session.
+        </para>
+        <para>
+         This setting can be overridden per-table via the
+         <literal>vacuum_punch_hole</literal> storage parameter (see
+         <xref linkend="sql-createtable-storage-parameters"/>), and per-command
+         via <command>VACUUM (PUNCH_HOLE ...)</command>.  The precedence is:
+         <command>VACUUM</command> option first, then the table's storage
+         parameter, then this GUC, then the built-in default
+         (<literal>false</literal>).
+        </para>
+        <para>
+         Punching deallocates whole filesystem blocks, so it only reclaims
+         space when the storage stack's allocation unit is no larger than
+         the database page size (<varname>block_size</varname>, normally
+         8&nbsp;kB).  If the filesystem block size or the disk sector size
+         is larger than a database page, punching a page's range frees no
+         space.  On SSDs the same holds for the device's delete
+         (deallocate) granularity, and the freed blocks only reach the
+         device at all if the filesystem issues discards for them.  On
+         such storage, enabling this option gains nothing while still
+         costing a syscall per relation segment.
+        </para>
+       </listitem>
+      </varlistentry>
+
+      <varlistentry id="guc-vacuum-punch-hole-min-size" xreflabel="vacuum_punch_hole_min_size">
+       <term><varname>vacuum_punch_hole_min_size</varname> (<type>integer</type>)
+       <indexterm>
+        <primary><varname>vacuum_punch_hole_min_size</varname></primary>
+        <secondary>configuration parameter</secondary>
+       </indexterm>
+       </term>
+       <listitem>
+        <para>
+         Minimum size of a filesystem hole punched by <command>VACUUM</command>,
+         in kilobytes.  Ranges smaller than this are not punched.  The value
+         must be <literal>0</literal> (automatic) or a multiple of the database
+         block size.  The default is <literal>0</literal>, which means the
+         database block size, or the filesystem block size if that is larger
+         (detected per file via <citerefentry><refentrytitle>fstatvfs</refentrytitle>
+         <manvolnum>2</manvolnum></citerefentry>).  This is a GUC-only setting;
+         per-table or per-command configuration is not supported because the
+         per-segment filesystem block size auto-detection already handles
+         tablespace heterogeneity.
+        </para>
+       </listitem>
+      </varlistentry>
      </variablelist>
     </sect2>
 
