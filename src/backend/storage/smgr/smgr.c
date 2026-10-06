@@ -120,6 +120,10 @@ typedef struct f_smgr
 	BlockNumber (*smgr_nblocks) (SMgrRelation reln, ForkNumber forknum);
 	void		(*smgr_truncate) (SMgrRelation reln, ForkNumber forknum,
 								  BlockNumber old_blocks, BlockNumber nblocks);
+	void		(*smgr_punchhole) (SMgrRelation reln, ForkNumber forknum,
+								   BlockNumber first_block, BlockNumber nblocks,
+								   int64 min_hole_bytes,
+								   MDPunchResult *result);
 	void		(*smgr_immedsync) (SMgrRelation reln, ForkNumber forknum);
 	void		(*smgr_registersync) (SMgrRelation reln, ForkNumber forknum);
 	int			(*smgr_fd) (SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off);
@@ -145,6 +149,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_writeback = mdwriteback,
 		.smgr_nblocks = mdnblocks,
 		.smgr_truncate = mdtruncate,
+		.smgr_punchhole = mdpunchhole,
 		.smgr_immedsync = mdimmedsync,
 		.smgr_registersync = mdregistersync,
 		.smgr_fd = mdfd,
@@ -922,6 +927,25 @@ smgrtruncate(SMgrRelation reln, ForkNumber *forknum, int nforks,
 		reln->smgr_cached_nblocks[forknum[i]] =
 			nblocks[i] > old_nblocks[i] ? old_nblocks[i] : nblocks[i];
 	}
+}
+
+/*
+ * smgrpunchhole() -- Deallocate the filesystem blocks backing a range of
+ *					  blocks, without changing the size of the file
+ *
+ * The range must consist of blocks that are known to read back as zeroes
+ * (e.g. completely empty heap pages found by VACUUM); see mdpunchhole()
+ * for the contract.  This is strictly best-effort: on platforms or
+ * filesystems without hole-punching support the call does nothing and
+ * reports it via result->unsupported.
+ */
+void
+smgrpunchhole(SMgrRelation reln, ForkNumber forknum, BlockNumber first_block,
+			  BlockNumber nblocks, int64 min_hole_bytes,
+			  MDPunchResult *result)
+{
+	smgrsw[reln->smgr_which].smgr_punchhole(reln, forknum, first_block,
+										   nblocks, min_hole_bytes, result);
 }
 
 /*

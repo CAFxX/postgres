@@ -25,6 +25,29 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/file.h>
+#ifdef HAVE_SYS_FSPACECTL_H
+#include <sys/fspacectl.h>
+#endif
+
+/*
+ * Detect hole-punching support here, right after the system headers that
+ * define the feature-test macros, so that the <sys/statvfs.h> include below
+ * can be conditioned on it (MSVC has no such header, and fstatvfs() is only
+ * used by the hole-punching code).  See the longer platform discussion
+ * further down, above md_punchhole_errno_unsupported().
+ */
+#if defined(FALLOC_FL_PUNCH_HOLE) || defined(F_PUNCHHOLE) || \
+	defined(HAVE_SYS_FSPACECTL_H) || \
+	((defined(__sun) || defined(__illumos__)) && defined(F_FREESP)) || \
+	defined(WIN32)
+#define HAVE_PUNCH_HOLE
+#endif
+
+#ifdef HAVE_PUNCH_HOLE
+#ifndef WIN32
+#include <sys/statvfs.h>
+#endif
+#endif
 
 #include "access/xlogutils.h"
 #include "commands/tablespace.h"
@@ -93,6 +116,12 @@ typedef struct _MdfdVec
 {
 	File		mdfd_vfd;		/* fd number in fd.c's pool */
 	BlockNumber mdfd_segno;		/* segment number, from 0 */
+	/*
+	 * Set when the filesystem backing this segment rejected hole punching
+	 * (EOPNOTSUPP etc.), so we don't pay for a failed syscall on every
+	 * mdpunchhole() call.
+	 */
+	bool		mdfd_punchhole_unsupported;
 } MdfdVec;
 
 static MemoryContext MdCxt;		/* context for all MdfdVec objects */
@@ -267,6 +296,7 @@ mdcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 	mdfd = &reln->md_seg_fds[forknum][0];
 	mdfd->mdfd_vfd = fd;
 	mdfd->mdfd_segno = 0;
+	mdfd->mdfd_punchhole_unsupported = false;
 
 	if (!SmgrIsTemp(reln))
 		register_dirty_segment(reln, forknum, mdfd);
@@ -700,6 +730,7 @@ mdopenfork(SMgrRelation reln, ForkNumber forknum, int behavior)
 	mdfd = &reln->md_seg_fds[forknum][0];
 	mdfd->mdfd_vfd = fd;
 	mdfd->mdfd_segno = 0;
+	mdfd->mdfd_punchhole_unsupported = false;
 
 	Assert(_mdnblocks(reln, forknum, mdfd) <= ((BlockNumber) RELSEG_SIZE));
 
@@ -1383,6 +1414,511 @@ mdtruncate(SMgrRelation reln, ForkNumber forknum,
 	}
 }
 
+#ifdef WIN32
+#include <winioctl.h>			/* FSCTL_SET_SPARSE, FSCTL_SET_ZERO_DATA */
+#include <io.h>					/* _get_osfhandle */
+#endif
+
+/*
+ * Platforms with a usable hole-punching API:
+ *
+ * - Linux: fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)
+ * - macOS: fcntl(F_PUNCHHOLE)
+ * - FreeBSD 14+: fspacectl(SPACECTL_DEALLOC)
+ * - Solaris/illumos: fcntl(F_FREESP)
+ * - Windows: DeviceIoControl(FSCTL_SET_ZERO_DATA) on a file marked sparse
+ *   via FSCTL_SET_SPARSE (deallocates the range; reads return zeroes)
+ *
+ * Platforms where mdpunchhole() is a silent no-op:
+ * - NetBSD, OpenBSD, DragonFly: no hole-punching API exists
+ *
+ * The feature macros above (defined near the top of the file, right after the
+ * system headers, so that header includes can be conditioned on them) keep
+ * this future-proof: a platform that grows a matching API is picked up
+ * automatically.  The FreeBSD and Solaris branches additionally require
+ * their OS macros, so that a hypothetical same-named macro on an unrelated
+ * platform cannot select the wrong branch.
+ */
+#ifdef HAVE_PUNCH_HOLE
+/*
+ * md_punchhole_errno_unsupported() -- is this errno "hole punching not
+ * supported" (as opposed to a real failure)?
+ *
+ * EOPNOTSUPP and ENOSYS mean the filesystem or kernel does not support hole
+ * punching.  EINVAL counts as "unsupported" only on macOS and Solaris (see
+ * below); on Linux and FreeBSD it indicates invalid arguments -- a
+ * programming bug in our range arithmetic -- and is treated as an unexpected
+ * failure.  (ENODEV is deliberately not listed: FreeBSD's fspacectl()
+ * returns ENODEV only for non-regular files, which is unreachable for
+ * relation segment files; an unsupported filesystem never errors there,
+ * the default vop_stddeallocate simply zero-fills the range and succeeds.)
+ *
+ * Anything else is an unexpected failure, but still not worth failing the
+ * caller over.
+ */
+static bool
+md_punchhole_errno_unsupported(int errnum)
+{
+	if (errnum == EOPNOTSUPP || errnum == ENOSYS)
+		return true;
+
+	/*
+	 * EINVAL-as-unsupported is legitimate only where it is documented as a
+	 * rejection rather than a bug: macOS (APFS rejects misaligned punches)
+	 * and Solaris (UFS/tmpfs return EINVAL for interior ranges; only the
+	 * l_len == 0 truncate form is implemented there).  On Linux,
+	 * fallocate(2) documents EINVAL for PUNCH_HOLE as "offset was less than
+	 * 0, or len was less than or equal to 0" -- invalid arguments, i.e. a
+	 * bug in our range construction, which the caller guarantees cannot
+	 * happen.  Likewise on FreeBSD, vn_fspacectl() returns EINVAL only for
+	 * bad offset/length/flags.  Misclassifying it as "unsupported" there
+	 * would silently and permanently disable the feature (via the latches)
+	 * instead of logging the bug.
+	 */
+#if defined(__APPLE__) || defined(__sun) || defined(__illumos__)
+	if (errnum == EINVAL)
+		return true;
+#endif
+
+	return false;
+}
+
+/*
+ * md_punchhole_range() -- punch a hole in one open file
+ *
+ * offset and length are byte offsets into the file: offset must be
+ * non-negative and length must be positive.  Both should be multiples of
+ * the filesystem block size; the caller aligns the range inward to
+ * f_bsize, so partial edge blocks are never passed here.
+ *
+ * Returns 0 on success, -1 on failure with errno set.  On success the
+ * punched range reads back as zeroes and the file size is unchanged; on
+ * failure the range contents are undefined (a partial punch is possible),
+ * and the caller decides how to classify errno.
+ *
+ * This function is compiled only when the platform provides a
+ * deallocation API (see HAVE_PUNCH_HOLE above).  Platforms without one
+ * never reach this function; mdpunchhole() handles them with a silent
+ * no-op.
+ *
+ * OpenBSD, NetBSD and DragonFly BSD have no file-range deallocation API
+ * (verified against their fcntl(2) man pages), so on those platforms this
+ * function is compiled out entirely.
+ */
+static int
+md_punchhole_range(int rawfd, off_t offset, off_t length)
+{
+	int			rc;
+
+#if defined(FALLOC_FL_PUNCH_HOLE)
+	do
+	{
+		rc = fallocate(rawfd, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
+					   offset, length);
+	} while (rc < 0 && errno == EINTR);
+	return rc;
+#elif defined(F_PUNCHHOLE)
+	fpunchhole_t fpunchhole;
+
+	MemSet(&fpunchhole, 0, sizeof(fpunchhole));
+	fpunchhole.fp_offset = offset;
+	fpunchhole.fp_length = length;
+
+	do
+	{
+		rc = fcntl(rawfd, F_PUNCHHOLE, &fpunchhole);
+	} while (rc < 0 && errno == EINTR);
+	return rc;
+#elif defined(HAVE_SYS_FSPACECTL_H)
+	struct spacectl_range range;
+
+	/*
+	 * fspacectl(SPACECTL_DEALLOC) zeroes the range on every filesystem,
+	 * and deallocates the underlying blocks where the filesystem
+	 * implements it.  Either way the caller-observable behavior (zeroes,
+	 * unchanged file size) holds.  Available since FreeBSD 14.0.
+	 *
+	 * Accounting wart: on filesystems without a native deallocate
+	 * implementation (e.g. UFS, which uses the default vop_stddeallocate),
+	 * the "punch" performs real zero-fill writes -- wasted I/O, the
+	 * opposite of the feature's goal -- yet success is still counted in
+	 * punched_blocks.  The range reads back as zeroes either way, so this
+	 * is only a reporting inaccuracy, but VERBOSE output should not be
+	 * read as "space reclaimed" on such filesystems.
+	 */
+	MemSet(&range, 0, sizeof(range));
+	range.r_offset = offset;
+	range.r_len = length;
+
+	do
+	{
+		rc = fspacectl(rawfd, SPACECTL_DEALLOC, &range, 0, NULL);
+	} while (rc < 0 && errno == EINTR);
+	return rc;
+#elif (defined(__sun) || defined(__illumos__)) && defined(F_FREESP)
+	struct flock fl;
+
+	/*
+	 * F_FREESP frees the blocks in the l_start..l_start+l_len range; the
+	 * file size is unchanged.  The man page specifies only the range
+	 * fields -- l_type is not examined by the space operation (verified
+	 * against illumos ufs_space(), tmp_space(), and zfs_space()), so we
+	 * zero it along with the rest.
+	 *
+	 * Filesystem behavior (verified against illumos-gate source): ZFS
+	 * implements F_FREESP for interior ranges via zfs_free_range(), so
+	 * this is a true hole punch there.  UFS and tmpfs only implement the
+	 * l_len == 0 (truncate-to-EOF) form and return EINVAL for interior
+	 * ranges; that surfaces as EINVAL, which the caller treats as
+	 * unsupported (best-effort no-op).  There is no truncation risk: we
+	 * never pass l_len == 0.
+	 */
+	MemSet(&fl, 0, sizeof(fl));
+	fl.l_whence = SEEK_SET;
+	fl.l_start = offset;
+	fl.l_len = length;
+
+	do
+	{
+		rc = fcntl(rawfd, F_FREESP, &fl);
+	} while (rc < 0 && errno == EINTR);
+	return rc;
+#elif defined(WIN32)
+	HANDLE		hFile;
+	FILE_ZERO_DATA_INFORMATION zdi;
+	DWORD		bytesReturned;
+	DWORD		err;
+
+	/*
+	 * PG's File descriptors on Windows are CRT file descriptors wrapping
+	 * Win32 HANDLEs (see pgwin32_open()); recover the HANDLE for
+	 * DeviceIoControl.
+	 */
+	hFile = (HANDLE) _get_osfhandle(rawfd);
+	if (hFile == INVALID_HANDLE_VALUE)
+	{
+		errno = EBADF;
+		return -1;
+	}
+
+	/*
+	 * FSCTL_SET_ZERO_DATA deallocates the range only when the file is
+	 * marked sparse; on a non-sparse file it zero-fills and allocates
+	 * storage for the whole range, the opposite of what we want.  Mark
+	 * the file sparse first, best-effort: the attribute is persistent and
+	 * the call is idempotent, so this costs one extra ioctl per segment
+	 * at most.  If the volume has no sparse support (FAT/exFAT), fail
+	 * with EOPNOTSUPP so the caller latches the filesystem as
+	 * unsupported.
+	 */
+	if (!DeviceIoControl(hFile, FSCTL_SET_SPARSE,
+						 NULL, 0, NULL, 0, &bytesReturned, NULL))
+	{
+		err = GetLastError();
+		if (err == ERROR_INVALID_FUNCTION || err == ERROR_NOT_SUPPORTED)
+			errno = EOPNOTSUPP;
+		else
+			_dosmaperr(err);
+		return -1;
+	}
+
+	/*
+	 * BeyondFinalZero is the first byte after the range, not a length.
+	 * On a sparse file the filesystem may deallocate the underlying
+	 * clusters; either way the range reads back as zeroes and the file
+	 * size is unchanged.  (This is the same mechanism Microsoft's ESE
+	 * database engine uses to return space to the filesystem.)
+	 */
+	zdi.FileOffset.QuadPart = (LONGLONG) offset;
+	zdi.BeyondFinalZero.QuadPart = (LONGLONG) offset + (LONGLONG) length;
+
+	if (!DeviceIoControl(hFile, FSCTL_SET_ZERO_DATA,
+						 &zdi, sizeof(zdi),
+						 NULL, 0, &bytesReturned, NULL))
+	{
+		err = GetLastError();
+		if (err == ERROR_INVALID_FUNCTION || err == ERROR_NOT_SUPPORTED)
+			errno = EOPNOTSUPP;
+		else
+			_dosmaperr(err);
+		return -1;
+	}
+	return 0;
+#else
+	/*
+	 * Defensive fallback, not a live no-op path: HAVE_PUNCH_HOLE (above)
+	 * is defined exactly when one of the API branches above matches, so
+	 * this is unreachable as long as the two stay in sync.  Kept so that a
+	 * future API added to HAVE_PUNCH_HOLE without a matching branch here
+	 * degrades to "unsupported" instead of falling off the end of the
+	 * function.  The real no-op for platforms without any deallocation
+	 * API is in mdpunchhole() below.
+	 */
+	(void) rawfd;
+	(void) offset;
+	(void) length;
+	errno = EOPNOTSUPP;
+	return -1;
+#endif
+}
+
+/*
+ * md_foreach_punch_segment() -- split a block range at segment boundaries
+ *
+ * Invokes callback once for each relation segment overlapped by the block
+ * range [startblk, startblk + nblocks), in increasing segment order.  For
+ * each segment the callback receives the first block number of the
+ * sub-range, the segment number, and the byte offset and length of the
+ * sub-range within that segment's file.
+ *
+ * The sub-ranges exactly tile the input range: they are contiguous,
+ * non-overlapping, block-aligned, and each is confined to a single segment.
+ * If nblocks is zero the callback is never invoked.
+ *
+ * This is a pure function of its arguments (it only needs RELSEG_SIZE and
+ * BLCKSZ); all smgr and file-descriptor interaction happens in the
+ * callback.  Keeping the splitting arithmetic separate from the syscall
+ * layer makes it unit-testable, which matters here: punching the wrong
+ * byte range would corrupt data.
+ */
+static void
+md_foreach_punch_segment(BlockNumber startblk, BlockNumber nblocks,
+						 void (*callback) (BlockNumber firstblock, int segno,
+										   off_t seg_off, off_t seg_len,
+										   void *arg),
+						 void *arg)
+{
+	while (nblocks > 0)
+	{
+		BlockNumber segnoffset; /* first block's offset within its segment */
+		BlockNumber segblocks;	/* # blocks of the range in this segment */
+
+		/*
+		 * Never span relation segments with a single call: each segment is
+		 * a separate file.
+		 */
+		segnoffset = startblk % ((BlockNumber) RELSEG_SIZE);
+		segblocks = Min(nblocks, ((BlockNumber) RELSEG_SIZE) - segnoffset);
+
+		callback(startblk,
+				 (int) (startblk / ((BlockNumber) RELSEG_SIZE)),
+				 (off_t) BLCKSZ * segnoffset,
+				 (off_t) BLCKSZ * segblocks,
+				 arg);
+
+		startblk += segblocks;
+		nblocks -= segblocks;
+	}
+}
+
+/* Private data threaded through md_foreach_punch_segment() to md_punch_one_segment(). */
+typedef struct md_punch_cb_arg
+{
+	SMgrRelation reln;
+	ForkNumber	forknum;
+	MDPunchResult *result;		/* outcome aggregation */
+	int64		min_hole_bytes;	/* minimum punch length, 0 = BLCKSZ */
+} md_punch_cb_arg;
+
+/*
+ * md_punch_one_segment() -- punch the hole for one segment's sub-range
+ *
+ * Callback for md_foreach_punch_segment(), used by mdpunchhole().
+ */
+static void
+md_punch_one_segment(BlockNumber firstblock, int segno,
+					 off_t seg_off, off_t seg_len, void *arg)
+{
+	md_punch_cb_arg *cbarg = (md_punch_cb_arg *) arg;
+	MdfdVec    *v;
+	int			rawfd;
+	BlockNumber nblocks;
+
+	(void) segno;	/* segment identity is implicit in firstblock; exposed for unit tests */
+
+	nblocks = (BlockNumber) (seg_len / BLCKSZ);
+
+	/*
+	 * Find the segment holding the first block, but don't create a new
+	 * segment file for this best-effort operation.  (An existing segment
+	 * file that isn't open yet will be opened.)
+	 */
+	v = _mdfd_getseg(cbarg->reln, cbarg->forknum, firstblock, false,
+					 EXTENSION_RETURN_NULL);
+	if (v == NULL)
+	{
+		/* shouldn't happen; skip this segment but try the rest */
+		cbarg->result->failed_blocks += nblocks;
+		return;
+	}
+
+	if (v->mdfd_punchhole_unsupported)
+	{
+		/* Already know this filesystem can't punch; count as unsupported. */
+		cbarg->result->unsupported = true;
+		return;
+	}
+
+	/*
+	 * Use the raw file descriptor for the punch call.  The segment is
+	 * already open, so FileGetRawDesc() will not need to do any I/O
+	 * here.  Use the descriptor immediately, as nothing may close it in
+	 * between.
+	 */
+	rawfd = FileGetRawDesc(v->mdfd_vfd);
+	if (rawfd < 0)
+	{
+		cbarg->result->failed_blocks += nblocks;
+		return;
+	}
+
+	/*
+	 * Align the range inward to the filesystem block size and enforce the
+	 * minimum hole size.  On most filesystems an unaligned punch silently
+	 * zeroes (rather than deallocates) the partial edge blocks; on macOS
+	 * APFS it fails with EINVAL.  Skipping too-small ranges avoids useless
+	 * syscalls.
+	 */
+	{
+		int64		fs_block;
+		off_t		aligned_off;
+		off_t		aligned_end;
+		int64		effective_min;
+
+#ifdef WIN32
+		/*
+		 * No fstatvfs() on Windows.  BLCKSZ (8kB) alignment is safe:
+		 * NTFS/ReFS clusters are at most 64kB and typically 4kB, so an
+		 * 8kB-aligned range covers whole clusters wherever deallocation
+		 * is possible; a smaller cluster just means we punch a little
+		 * more conservatively.
+		 */
+		fs_block = BLCKSZ;
+#else
+		struct statvfs st;
+
+		if (fstatvfs(rawfd, &st) == 0 && st.f_bsize > 0)
+			fs_block = (int64) st.f_bsize;
+		else
+			fs_block = BLCKSZ;	/* best we can do blind */
+#endif
+
+		/*
+		 * BLCKSZ and fs_block are assumed to be powers of 2, one dividing
+		 * the other.  This is not a POSIX guarantee for statvfs f_bsize,
+		 * but the blast radius of a violation is benign: the byte range
+		 * handed to the kernel is always correct regardless (only the
+		 * nblocks counting could be off), and every byte lies within
+		 * locked, verified-empty pages.
+		 */
+		effective_min = cbarg->min_hole_bytes > 0 ? cbarg->min_hole_bytes : BLCKSZ;
+		if (effective_min < fs_block)
+			effective_min = fs_block;
+
+		aligned_off = (seg_off + fs_block - 1) / fs_block * fs_block;
+		aligned_end = (seg_off + seg_len) / fs_block * fs_block;
+
+		if (aligned_end - aligned_off < effective_min)
+		{
+			/* Too small to be worth punching (or nothing to punch). */
+			return;
+		}
+
+		seg_off = aligned_off;
+		seg_len = aligned_end - aligned_off;
+		nblocks = (BlockNumber) (seg_len / BLCKSZ);
+	}
+
+	if (md_punchhole_range(rawfd, seg_off, seg_len) < 0)
+	{
+		if (md_punchhole_errno_unsupported(errno))
+		{
+			v->mdfd_punchhole_unsupported = true;
+			cbarg->result->unsupported = true;
+		}
+		else
+		{
+			/* Unexpected failure; log it, but don't fail the caller. */
+			ereport(LOG,
+					(errcode_for_file_access(),
+					 errmsg("could not punch hole in file \"%s\": %m",
+							FilePathName(v->mdfd_vfd))));
+			cbarg->result->failed_blocks += nblocks;
+		}
+	}
+	else
+	{
+		cbarg->result->punched_blocks += nblocks;
+	}
+}
+#endif							/* HAVE_PUNCH_HOLE */
+
+/*
+ * mdpunchhole() -- Deallocate the filesystem blocks backing a range of blocks
+ *
+ * Deallocates the storage for blocks that are known to read back as zeroes
+ * (e.g. completely empty heap pages found by VACUUM), without changing the
+ * size of the file.  A subsequent write to the range transparently
+ * reallocates the storage, so this is invisible to higher layers.
+ *
+ * The range may span relation segments; each segment is punched with a
+ * single call.  This batching is what makes punching many contiguous empty
+ * pages cheap: one syscall per segment instead of one per block.
+ *
+ * This is strictly a best-effort space reclamation: on platforms without
+ * hole-punching support, or on filesystems that don't implement it, this
+ * function does nothing and never reports an error.  Segments whose
+ * filesystem rejects the operation are remembered, so unsupported
+ * filesystems cost a single failed syscall per segment file.
+ *
+ * The caller must ensure every block in the range is empty and cannot
+ * concurrently gain content; e.g. vacuum punches holes in heap pages only
+ * while holding a buffer lock on each page it has verified to be empty.
+ *
+ * This relies on the kernel implementing hole punching correctly for the
+ * range given: the deallocated range must read back as zeroes without
+ * disturbing adjacent blocks.  (A 2026 Linux series fixing data loss in
+ * truncate_inode_partial_folio(), the generic page-cache path shared by
+ * hole punching, was still unmerged at the time of writing; that is a
+ * kernel bug affecting all FALLOC_FL_PUNCH_HOLE users, not something this
+ * code can work around.)
+ */
+void
+mdpunchhole(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+			BlockNumber nblocks, int64 min_hole_bytes,
+			MDPunchResult *result)
+{
+#ifdef HAVE_PUNCH_HOLE
+	md_punch_cb_arg arg;
+
+	/* Initialize result; caller may aggregate across calls. */
+	result->punched_blocks = 0;
+	result->failed_blocks = 0;
+	result->unsupported = false;
+
+	arg.reln = reln;
+	arg.forknum = forknum;
+	arg.result = result;
+	arg.min_hole_bytes = min_hole_bytes;
+
+	md_foreach_punch_segment(blocknum, nblocks, md_punch_one_segment, &arg);
+#else
+	/*
+	 * No hole-punching support on this platform; silently do nothing.
+	 * This is the normal path on Windows (which has no suitable
+	 * deallocation API: FSCTL_SET_ZERO_DATA only zeroes, it does not
+	 * deallocate) and on the BSDs without a file-range deallocation API.
+	 */
+	result->punched_blocks = 0;
+	result->failed_blocks = 0;
+	result->unsupported = true;
+	(void) reln;
+	(void) forknum;
+	(void) blocknum;
+	(void) nblocks;
+#endif
+}
+
 /*
  * mdregistersync() -- Mark whole relation as needing fsync
  */
@@ -1736,6 +2272,7 @@ _mdfd_openseg(SMgrRelation reln, ForkNumber forknum, BlockNumber segno,
 	v = &reln->md_seg_fds[forknum][segno];
 	v->mdfd_vfd = fd;
 	v->mdfd_segno = segno;
+	v->mdfd_punchhole_unsupported = false;
 
 	Assert(_mdnblocks(reln, forknum, v) <= ((BlockNumber) RELSEG_SIZE));
 
