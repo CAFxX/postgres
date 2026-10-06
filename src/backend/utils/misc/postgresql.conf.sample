@@ -775,6 +775,8 @@
 # - Default Behavior -
 
 #vacuum_truncate = on                   # enable truncation after vacuum
+#vacuum_punch_hole = off                # enable deallocation of filesystem
+                                        # blocks backing fully-empty heap pages
 
 # - Freezing -
 
