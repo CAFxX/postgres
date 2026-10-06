@@ -1904,10 +1904,9 @@ mdpunchhole(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	md_foreach_punch_segment(blocknum, nblocks, md_punch_one_segment, &arg);
 #else
 	/*
-	 * No hole-punching support on this platform; silently do nothing.
-	 * This is the normal path on Windows (which has no suitable
-	 * deallocation API: FSCTL_SET_ZERO_DATA only zeroes, it does not
-	 * deallocate) and on the BSDs without a file-range deallocation API.
+	 	 * No hole-punching support on this platform; silently do nothing.
+	 * This is the normal path on the BSDs without a file-range
+	 * deallocation API (NetBSD, OpenBSD, DragonFly).
 	 */
 	result->punched_blocks = 0;
 	result->failed_blocks = 0;
