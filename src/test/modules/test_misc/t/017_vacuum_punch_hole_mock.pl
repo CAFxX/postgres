@@ -36,7 +36,7 @@ if (system("$cc_probe --version >/dev/null 2>&1") != 0)
 	plan skip_all => 'no C compiler available';
 }
 
-plan tests => 11;
+plan tests => 12;
 
 my $test_dir = dirname(__FILE__);
 my $md_c = File::Spec->rel2abs(
@@ -44,18 +44,17 @@ my $md_c = File::Spec->rel2abs(
 		'backend', 'storage', 'smgr', 'md.c'));
 my $tmpdir = $PostgreSQL::Test::Utils::tmp_check;
 
-# Extract md_punchhole_range() from md.c by brace matching.  Always extracts
+# Extract a static function from md.c by brace matching.  Always extracts
 # from the current source, so the test can never go stale.
 sub extract_function
 {
-	my ($path) = @_;
+	my ($path, $sig, $funcname) = @_;
 	open my $fh, '<', $path or die "cannot open $path: $!";
 	my $src = do { local $/; <$fh> };
 	close $fh;
 
-	my $sig = "static int\nmd_punchhole_range(int rawfd, off_t offset, off_t length)\n{";
 	my $pos = index($src, $sig);
-	die "md_punchhole_range not found in $path" if $pos < 0;
+	die "$funcname not found in $path" if $pos < 0;
 
 	# Brace-match from the opening brace of the function body.
 	my $i = $pos + length($sig) - 1;    # at the '{'
@@ -72,11 +71,19 @@ sub extract_function
 		}
 		$i++;
 	}
-	die "unbalanced braces extracting md_punchhole_range from $path";
+	die "unbalanced braces extracting $funcname from $path";
 }
 
-my $func_text = extract_function($md_c);
+my $func_text = extract_function($md_c,
+	"static int\nmd_punchhole_range(int rawfd, off_t offset, off_t length)\n{",
+	"md_punchhole_range");
 ok(length($func_text) > 100, 'extracted md_punchhole_range from md.c');
+
+# md_ensure_sparse() is Windows-only; extract it for the TEST_WINDOWS variant.
+my $sparse_func_text = extract_function($md_c,
+	"static int\nmd_ensure_sparse(int rawfd)\n{",
+	"md_ensure_sparse");
+ok(length($sparse_func_text) > 100, 'extracted md_ensure_sparse from md.c');
 
 # C template with mocked syscalls.  The real function text is appended.
 my $c_template = <<'EOF';
@@ -489,49 +496,79 @@ main(void)
 #endif
 
 #ifdef TEST_WINDOWS
-	/* success: sparse mark then zero-data with correct byte range */
-	dio_len = 2;
+	/* md_ensure_sparse: success path */
+	dio_len = 1;
 	dio_err_seq[0] = 0;
-	dio_err_seq[1] = 0;
 	dio_calls = 0;
 	get_osfhandle_calls = 0;
 	mock_osfhandle = 0x1234;
+	rc = md_ensure_sparse(42);
+	assert(rc == 0);
+	assert(get_osfhandle_calls == 1);
+	assert(last_osfhandle_fd == 42);
+	assert(dio_calls == 1);
+	assert(dio_fsctl_record[0] == FSCTL_SET_SPARSE);
+	assert(dio_handle_record[0] == (HANDLE) 0x1234);
+	printf("windows: ensure_sparse success OK\n");
+
+	/* md_ensure_sparse: volume without sparse support -> EOPNOTSUPP */
+	dio_len = 1;
+	dio_err_seq[0] = ERROR_INVALID_FUNCTION;
+	dio_calls = 0;
+	rc = md_ensure_sparse(42);
+	assert(rc == -1);
+	assert(errno == EOPNOTSUPP);
+	assert(dio_calls == 1);
+	printf("windows: ensure_sparse unsupported OK\n");
+
+	/* md_ensure_sparse: other failure -> mapped errno */
+	dio_len = 1;
+	dio_err_seq[0] = ERROR_ACCESS_DENIED;
+	dio_calls = 0;
+	rc = md_ensure_sparse(42);
+	assert(rc == -1);
+	assert(errno == EIO);
+	assert(dio_calls == 1);
+	printf("windows: ensure_sparse error propagation OK\n");
+
+	/* md_ensure_sparse: bad handle -> EBADF */
+	mock_osfhandle = -1;		/* INVALID_HANDLE_VALUE */
+	dio_calls = 0;
+	get_osfhandle_calls = 0;
+	rc = md_ensure_sparse(42);
+	assert(rc == -1);
+	assert(errno == EBADF);
+	assert(dio_calls == 0);
+	mock_osfhandle = 0x1234;
+	printf("windows: ensure_sparse bad handle OK\n");
+
+	/* md_punchhole_range: success path (sparse already ensured by caller) */
+	dio_len = 1;
+	dio_err_seq[0] = 0;
+	dio_calls = 0;
+	get_osfhandle_calls = 0;
 	rc = md_punchhole_range(42, (off_t) 8192 * 3, (off_t) 8192 * 16);
 	assert(rc == 0);
 	assert(get_osfhandle_calls == 1);
 	assert(last_osfhandle_fd == 42);
-	assert(dio_calls == 2);
-	assert(dio_fsctl_record[0] == FSCTL_SET_SPARSE);
-	assert(dio_fsctl_record[1] == FSCTL_SET_ZERO_DATA);
+	assert(dio_calls == 1);
+	assert(dio_fsctl_record[0] == FSCTL_SET_ZERO_DATA);
 	assert(dio_handle_record[0] == (HANDLE) 0x1234);
-	assert(dio_handle_record[1] == (HANDLE) 0x1234);
 	assert(last_file_offset == (LONGLONG) 8192 * 3);
 	assert(last_beyond_final_zero == (LONGLONG) 8192 * 19);
 	printf("windows: success path OK\n");
 
-	/* sparse unsupported -> EOPNOTSUPP so the caller latches off */
+	/* md_punchhole_range: zero-data failure -> mapped errno, no latch */
 	dio_len = 1;
-	dio_err_seq[0] = ERROR_INVALID_FUNCTION;
-	dio_calls = 0;
-	rc = md_punchhole_range(42, 0, 8192);
-	assert(rc == -1);
-	assert(errno == EOPNOTSUPP);
-	assert(dio_calls == 1);
-	assert(dio_fsctl_record[0] == FSCTL_SET_SPARSE);
-	printf("windows: sparse-unsupported OK\n");
-
-	/* zero-data failure -> mapped errno, no latch */
-	dio_len = 2;
-	dio_err_seq[0] = 0;
-	dio_err_seq[1] = ERROR_ACCESS_DENIED;
+	dio_err_seq[0] = ERROR_ACCESS_DENIED;
 	dio_calls = 0;
 	rc = md_punchhole_range(42, 0, 8192);
 	assert(rc == -1);
 	assert(errno == EIO);
-	assert(dio_calls == 2);
+	assert(dio_calls == 1);
 	printf("windows: error propagation OK\n");
 
-	/* bad handle -> EBADF before any ioctl */
+	/* md_punchhole_range: bad handle -> EBADF before any ioctl */
 	mock_osfhandle = -1;		/* INVALID_HANDLE_VALUE */
 	dio_calls = 0;
 	get_osfhandle_calls = 0;
@@ -559,6 +596,11 @@ sub run_mock_variant
 	open my $fh, '>', $c_file or die "cannot write $c_file: $!";
 	print $fh $c_template;
 	print $fh $func_text;
+	# md_ensure_sparse() is Windows-only; include it for the Windows variant.
+	if ($define eq 'TEST_WINDOWS')
+	{
+		print $fh $sparse_func_text;
+	}
 	print $fh $c_main;
 	close $fh or die "cannot close $c_file: $!";
 
@@ -698,7 +740,9 @@ EOF
 # macros defined and verify it reports EOPNOTSUPP (so the caller latches
 # the segment as unsupported instead of miscounting blocks as punched).
 {
-	my $noop_text = extract_function($md_c);
+	my $noop_text = extract_function($md_c,
+		"static int\nmd_punchhole_range(int rawfd, off_t offset, off_t length)\n{",
+		"md_punchhole_range");
 	my $c_file = File::Spec->catfile($tmpdir, 'noop_test.c');
 	my $bin = File::Spec->catfile($tmpdir, 'noop_test');
 	open my $fh, '>', $c_file or die "cannot write $c_file: $!";
@@ -710,6 +754,7 @@ EOF
 	print $fh "#undef F_PUNCHHOLE\n";
 	print $fh "#undef SPACECTL_DEALLOC\n";
 	print $fh "#undef F_FREESP\n";
+	print $fh "#undef WIN32\n";
 	print $fh $noop_text;
 	print $fh <<'EOF';
 int main(void) {
