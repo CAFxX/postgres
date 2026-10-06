@@ -122,6 +122,12 @@ typedef struct _MdfdVec
 	 * mdpunchhole() call.
 	 */
 	bool		mdfd_punchhole_unsupported;
+	/*
+	 * Set once the segment's file has been marked sparse (Windows only;
+	 * required for FSCTL_SET_ZERO_DATA to deallocate).  The attribute is
+	 * persistent, so one ioctl per open segment suffices.
+	 */
+	bool		mdfd_sparse_ensured;
 } MdfdVec;
 
 static MemoryContext MdCxt;		/* context for all MdfdVec objects */
@@ -297,6 +303,7 @@ mdcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 	mdfd->mdfd_vfd = fd;
 	mdfd->mdfd_segno = 0;
 	mdfd->mdfd_punchhole_unsupported = false;
+	mdfd->mdfd_sparse_ensured = false;
 
 	if (!SmgrIsTemp(reln))
 		register_dirty_segment(reln, forknum, mdfd);
@@ -731,6 +738,7 @@ mdopenfork(SMgrRelation reln, ForkNumber forknum, int behavior)
 	mdfd->mdfd_vfd = fd;
 	mdfd->mdfd_segno = 0;
 	mdfd->mdfd_punchhole_unsupported = false;
+	mdfd->mdfd_sparse_ensured = false;
 
 	Assert(_mdnblocks(reln, forknum, mdfd) <= ((BlockNumber) RELSEG_SIZE));
 
@@ -1483,6 +1491,50 @@ md_punchhole_errno_unsupported(int errnum)
 	return false;
 }
 
+#ifdef WIN32
+/*
+ * md_ensure_sparse() -- mark the file sparse so that FSCTL_SET_ZERO_DATA
+ * deallocates the range instead of allocating storage for it.
+ *
+ * The sparse attribute is persistent and the ioctl idempotent; callers
+ * arrange to call this once per open segment (see mdfd_sparse_ensured).
+ *
+ * Returns 0 on success, -1 on failure with errno set.  EOPNOTSUPP means
+ * the volume has no sparse support (e.g. FAT/exFAT).
+ */
+static int
+md_ensure_sparse(int rawfd)
+{
+	HANDLE		hFile;
+	DWORD		bytesReturned;
+	DWORD		err;
+
+	/*
+	 * PG's File descriptors on Windows are CRT file descriptors wrapping
+	 * Win32 HANDLEs (see pgwin32_open()); recover the HANDLE for
+	 * DeviceIoControl.
+	 */
+	hFile = (HANDLE) _get_osfhandle(rawfd);
+	if (hFile == INVALID_HANDLE_VALUE)
+	{
+		errno = EBADF;
+		return -1;
+	}
+
+	if (!DeviceIoControl(hFile, FSCTL_SET_SPARSE,
+						 NULL, 0, NULL, 0, &bytesReturned, NULL))
+	{
+		err = GetLastError();
+		if (err == ERROR_INVALID_FUNCTION || err == ERROR_NOT_SUPPORTED)
+			errno = EOPNOTSUPP;
+		else
+			_dosmaperr(err);
+		return -1;
+	}
+	return 0;
+}
+#endif
+
 /*
  * md_punchhole_range() -- punch a hole in one open file
  *
@@ -1592,33 +1644,14 @@ md_punchhole_range(int rawfd, off_t offset, off_t length)
 	/*
 	 * PG's File descriptors on Windows are CRT file descriptors wrapping
 	 * Win32 HANDLEs (see pgwin32_open()); recover the HANDLE for
-	 * DeviceIoControl.
+	 * DeviceIoControl.  The caller ensures the file is marked sparse
+	 * (see md_ensure_sparse()), without which SET_ZERO_DATA would
+	 * allocate rather than deallocate.
 	 */
 	hFile = (HANDLE) _get_osfhandle(rawfd);
 	if (hFile == INVALID_HANDLE_VALUE)
 	{
 		errno = EBADF;
-		return -1;
-	}
-
-	/*
-	 * FSCTL_SET_ZERO_DATA deallocates the range only when the file is
-	 * marked sparse; on a non-sparse file it zero-fills and allocates
-	 * storage for the whole range, the opposite of what we want.  Mark
-	 * the file sparse first, best-effort: the attribute is persistent and
-	 * the call is idempotent, so this costs one extra ioctl per segment
-	 * at most.  If the volume has no sparse support (FAT/exFAT), fail
-	 * with EOPNOTSUPP so the caller latches the filesystem as
-	 * unsupported.
-	 */
-	if (!DeviceIoControl(hFile, FSCTL_SET_SPARSE,
-						 NULL, 0, NULL, 0, &bytesReturned, NULL))
-	{
-		err = GetLastError();
-		if (err == ERROR_INVALID_FUNCTION || err == ERROR_NOT_SUPPORTED)
-			errno = EOPNOTSUPP;
-		else
-			_dosmaperr(err);
 		return -1;
 	}
 
@@ -1829,6 +1862,37 @@ md_punch_one_segment(BlockNumber firstblock, int segno,
 		nblocks = (BlockNumber) (seg_len / BLCKSZ);
 	}
 
+#ifdef WIN32
+	/*
+	 * FSCTL_SET_ZERO_DATA only deallocates on sparse files; ensure the
+	 * file is marked sparse once per open segment (the attribute is
+	 * persistent, so the flag never goes stale while the segment is
+	 * open).  Done here -- after the too-small early return -- so we
+	 * only pay the ioctl when we're actually going to punch.
+	 */
+	if (!v->mdfd_sparse_ensured)
+	{
+		if (md_ensure_sparse(rawfd) < 0)
+		{
+			if (md_punchhole_errno_unsupported(errno))
+			{
+				v->mdfd_punchhole_unsupported = true;
+				cbarg->result->unsupported = true;
+			}
+			else
+			{
+				ereport(LOG,
+						(errcode_for_file_access(),
+						 errmsg("could not mark file \"%s\" sparse: %m",
+								FilePathName(v->mdfd_vfd))));
+				cbarg->result->failed_blocks += nblocks;
+			}
+			return;
+		}
+		v->mdfd_sparse_ensured = true;
+	}
+#endif
+
 	if (md_punchhole_range(rawfd, seg_off, seg_len) < 0)
 	{
 		if (md_punchhole_errno_unsupported(errno))
@@ -1904,7 +1968,7 @@ mdpunchhole(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	md_foreach_punch_segment(blocknum, nblocks, md_punch_one_segment, &arg);
 #else
 	/*
-	 	 * No hole-punching support on this platform; silently do nothing.
+	 * No hole-punching support on this platform; silently do nothing.
 	 * This is the normal path on the BSDs without a file-range
 	 * deallocation API (NetBSD, OpenBSD, DragonFly).
 	 */
@@ -2272,6 +2336,7 @@ _mdfd_openseg(SMgrRelation reln, ForkNumber forknum, BlockNumber segno,
 	v->mdfd_vfd = fd;
 	v->mdfd_segno = segno;
 	v->mdfd_punchhole_unsupported = false;
+	v->mdfd_sparse_ensured = false;
 
 	Assert(_mdnblocks(reln, forknum, v) <= ((BlockNumber) RELSEG_SIZE));
 
