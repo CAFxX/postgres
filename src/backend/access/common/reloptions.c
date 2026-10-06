@@ -175,6 +175,14 @@ static relopt_ternary ternaryRelOpts[] =
 			ShareUpdateExclusiveLock
 		}
 	},
+	{
+		{
+			"vacuum_punch_hole",
+			"Enables vacuum to deallocate filesystem blocks backing fully-empty heap pages",
+			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST,
+			ShareUpdateExclusiveLock
+		}
+	},
 	/* list terminator */
 	{
 		{
@@ -2116,6 +2124,8 @@ static const relopt_parse_elt stdRdOptionsTab[] = {
 	offsetof(StdRdOptions, vacuum_index_cleanup)},
 	{"vacuum_truncate", RELOPT_TYPE_TERNARY,
 	offsetof(StdRdOptions, vacuum_truncate)},
+	{"vacuum_punch_hole", RELOPT_TYPE_TERNARY,
+	offsetof(StdRdOptions, vacuum_punch_hole)},
 	{"vacuum_max_eager_freeze_failure_rate", RELOPT_TYPE_REAL,
 	offsetof(StdRdOptions, vacuum_max_eager_freeze_failure_rate)}
 };
