@@ -83,6 +83,32 @@ int			vacuum_multixact_failsafe_age;
 double		vacuum_max_eager_freeze_failure_rate;
 bool		track_cost_delay_timing;
 bool		vacuum_truncate;
+bool		vacuum_punch_hole;
+int			vacuum_punch_hole_min_size;
+
+/*
+ * check_vacuum_punch_hole_min_size -- GUC check hook
+ *
+ * The minimum hole size must be 0 (auto) or a positive multiple of BLCKSZ.
+ * The GUC uses kB units; BLCKSZ is always a whole number of kB.
+ */
+bool
+check_vacuum_punch_hole_min_size(int *newval, void **extra, GucSource source)
+{
+	int		blcksz_kb = BLCKSZ / 1024;
+
+	/*
+	 * No < 0 check needed: guc_parameters.dat declares min 0, which guc.c
+	 * enforces before invoking the check hook.
+	 */
+	if (*newval != 0 && (*newval % blcksz_kb) != 0)
+	{
+		GUC_check_errdetail("vacuum_punch_hole_min_size must be 0 or a multiple of the database block size (%d kB).",
+							blcksz_kb);
+		return false;
+	}
+	return true;
+}
 
 /*
  * Variables for cost-based vacuum delay. The defaults differ between
@@ -179,9 +205,10 @@ ExecVacuum(ParseState *pstate, VacuumStmt *vacstmt, bool isTopLevel)
 	MemoryContext vac_context;
 	ListCell   *lc;
 
-	/* index_cleanup and truncate values unspecified for now */
+	/* index_cleanup, truncate and punch_hole values unspecified for now */
 	params.index_cleanup = VACOPTVALUE_UNSPECIFIED;
 	params.truncate = VACOPTVALUE_UNSPECIFIED;
+	params.punch_hole = VACOPTVALUE_UNSPECIFIED;
 
 	/* By default parallel vacuum is enabled */
 	params.nworkers = 0;
@@ -270,6 +297,8 @@ ExecVacuum(ParseState *pstate, VacuumStmt *vacstmt, bool isTopLevel)
 			process_toast = defGetBoolean(opt);
 		else if (strcmp(opt->defname, "truncate") == 0)
 			params.truncate = get_vacoptval_from_boolean(opt);
+		else if (strcmp(opt->defname, "punch_hole") == 0)
+			params.punch_hole = get_vacoptval_from_boolean(opt);
 		else if (strcmp(opt->defname, "parallel") == 0)
 		{
 			int			nworkers = defGetInt32(opt);
@@ -2287,6 +2316,25 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams params,
 	else if (params.truncate == VACOPTVALUE_ENABLED)
 		INJECTION_POINT("vacuum-truncate-enabled", NULL);
 #endif
+
+	/*
+	 * Set punch_hole option based on punch_hole reloption or GUC if it wasn't
+	 * specified in VACUUM command, or when running in an autovacuum worker
+	 */
+	if (params.punch_hole == VACOPTVALUE_UNSPECIFIED)
+	{
+		if (relopts && relopts->vacuum_punch_hole != PG_TERNARY_UNSET)
+		{
+			if (relopts->vacuum_punch_hole == PG_TERNARY_TRUE)
+				params.punch_hole = VACOPTVALUE_ENABLED;
+			else
+				params.punch_hole = VACOPTVALUE_DISABLED;
+		}
+		else if (vacuum_punch_hole)
+			params.punch_hole = VACOPTVALUE_ENABLED;
+		else
+			params.punch_hole = VACOPTVALUE_DISABLED;
+	}
 
 	/*
 	 * Remember the relation's TOAST relation for later, if the caller asked

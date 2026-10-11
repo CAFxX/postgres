@@ -2869,6 +2869,7 @@ header_checks = [
   'strings.h',
   'sys/epoll.h',
   'sys/event.h',
+  'sys/fspacectl.h',
   'sys/personality.h',
   'sys/prctl.h',
   'sys/procctl.h',

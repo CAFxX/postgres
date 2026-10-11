@@ -115,6 +115,34 @@ extern BlockNumber smgrnblocks_cached(SMgrRelation reln, ForkNumber forknum);
 extern void smgrtruncate(SMgrRelation reln, ForkNumber *forknum, int nforks,
 						 BlockNumber *old_nblocks,
 						 BlockNumber *nblocks);
+/*
+ * MDPunchResult -- outcome of smgrpunchhole()
+ *
+ * Hole punching is best-effort: the caller needs to distinguish "storage
+ * was deallocated" from "filesystem does not support it" from "syscall
+ * failed", so it can count accurately and stop trying on unsupported
+ * filesystems.
+ */
+typedef struct MDPunchResult
+{
+	BlockNumber punched_blocks;	/* blocks whose storage was deallocated */
+	BlockNumber failed_blocks;	/* blocks where the syscall failed (not unsupported) */
+	bool		unsupported;	/* filesystem/kernel lacks hole-punch support */
+} MDPunchResult;
+
+/*
+ * smgrpunchhole() -- deallocate the filesystem blocks backing a range of
+ * blocks, without changing the file size (see mdpunchhole() in md.c).
+ *
+ * min_hole_bytes is the minimum hole length worth punching; 0 means "auto"
+ * (the database block size, or the filesystem block size if larger).  The
+ * result struct is always initialized, even on platforms without
+ * hole-punching support (reported via unsupported = true).
+ */
+extern void smgrpunchhole(SMgrRelation reln, ForkNumber forknum,
+						  BlockNumber first_block, BlockNumber nblocks,
+						  int64 min_hole_bytes,
+						  MDPunchResult *result);
 extern void smgrimmedsync(SMgrRelation reln, ForkNumber forknum);
 extern void smgrregistersync(SMgrRelation reln, ForkNumber forknum);
 extern void AtEOXact_SMgr(void);

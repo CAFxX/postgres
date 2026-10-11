@@ -370,6 +370,7 @@ typedef struct StdRdOptions
 	int			parallel_workers;	/* max number of parallel workers */
 	StdRdOptIndexCleanup vacuum_index_cleanup;	/* controls index vacuuming */
 	pg_ternary	vacuum_truncate;	/* enables vacuum to truncate a relation */
+	pg_ternary	vacuum_punch_hole; /* enables vacuum to punch holes in empty pages */
 
 	/*
 	 * Fraction of pages in a relation that vacuum can eagerly scan and fail

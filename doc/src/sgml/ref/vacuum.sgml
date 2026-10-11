@@ -39,6 +39,7 @@ VACUUM [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] [ <re
     ONLY_DATABASE_STATS [ <replaceable class="parameter">boolean</replaceable> ]
     BUFFER_USAGE_LIMIT <replaceable class="parameter">size</replaceable>
     FULL [ <replaceable class="parameter">boolean</replaceable> ]
+    PUNCH_HOLE [ <replaceable class="parameter">boolean</replaceable> ]
 
 <phrase>and <replaceable class="parameter">table_and_columns</replaceable> is:</phrase>
 
@@ -346,6 +347,22 @@ VACUUM [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] [ <re
       new copy of the table and doesn't release the old copy until
       the operation is complete.  Usually this should only be used when a
       significant amount of space needs to be reclaimed from within the table.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><literal>PUNCH_HOLE</literal></term>
+    <listitem>
+     <para>
+      Deallocate the filesystem blocks backing fully-empty heap pages
+      (<quote>hole punching</quote>), instead of leaving them allocated.
+      This overrides the <varname>vacuum_punch_hole</varname> configuration
+      parameter and the table's <literal>vacuum_punch_hole</literal> storage
+      parameter for this command.  See <xref linkend="guc-vacuum-punch-hole"/>
+      for details on the behavior, including the requirement that pages be
+      completely empty, not marked all-visible, and unmodified since the
+      last checkpoint.
      </para>
     </listitem>
    </varlistentry>

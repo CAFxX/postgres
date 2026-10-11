@@ -2924,12 +2924,13 @@ table_recheck_autovac(Oid relid, HTAB *table_toast_map,
 			(!wraparound ? VACOPT_SKIP_LOCKED : 0);
 
 		/*
-		 * index_cleanup and truncate are unspecified at first in autovacuum.
-		 * They will be filled in with usable values using their reloptions
-		 * (or reloption defaults) later.
+		 * index_cleanup, truncate and punch_hole are unspecified at first in
+		 * autovacuum.  They will be filled in with usable values using their
+		 * reloptions (or reloption defaults) later.
 		 */
 		tab->at_params.index_cleanup = VACOPTVALUE_UNSPECIFIED;
 		tab->at_params.truncate = VACOPTVALUE_UNSPECIFIED;
+		tab->at_params.punch_hole = VACOPTVALUE_UNSPECIFIED;
 		tab->at_params.freeze_min_age = freeze_min_age;
 		tab->at_params.freeze_table_age = freeze_table_age;
 		tab->at_params.multixact_freeze_min_age = multixact_freeze_min_age;
